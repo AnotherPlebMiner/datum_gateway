@@ -141,7 +141,29 @@ static void datum_utils_tests_pdiff_to_bdiff(void) {
 	datum_test(datum_pdiff_to_bdiff(16) == 15.999755859375L);
 }
 
+static void datum_utils_tests_near_target(void) {
+	uint8_t target[32] = {0}, hash[32] = {0};
+	int hb = 0, tb = 0;
+	target[31 - 8] = 0x01;  // 64 zero bits + 7 = 71 leading zero bits
+	datum_test(datum_hash_leading_zero_bits(target) == 71);
+	memset(hash, 0xff, sizeof(hash));
+	datum_test(datum_hash_leading_zero_bits(hash) == 0);
+	memset(hash, 0, sizeof(hash));
+	datum_test(datum_hash_leading_zero_bits(hash) == 256);
+	
+	hash[31 - 8] = 0x04;  // 69 bits: within 2
+	datum_test(datum_hash_is_near_target(hash, target, 2, &hb, &tb));
+	datum_test(hb == 69 && tb == 71);
+	hash[31 - 8] = 0x08;  // 68 bits: too far
+	datum_test(!datum_hash_is_near_target(hash, target, 2, NULL, NULL));
+	hash[31 - 8] = 0x01;  // equals target: it's a block, not a near miss
+	datum_test(!datum_hash_is_near_target(hash, target, 2, NULL, NULL));
+	hash[31 - 8] = 0x04;
+	datum_test(!datum_hash_is_near_target(hash, target, 0, NULL, NULL));
+}
+
 void datum_utils_tests(void) {
+	datum_utils_tests_near_target();
 	datum_utils_tests_hex();
 	datum_utils_tests_secure_strequals();
 	datum_utils_tests_scriptnum();

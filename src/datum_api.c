@@ -1387,6 +1387,15 @@ bool datum_api_config_set(const char * const key, const char * const val, struct
 		}
 		// TODO: apply change without restarting (and don't interfere with existing jobs)
 		status->need_restart = true;
+	} else if (0 == strcmp(key, "logger_near_block_bits")) {
+		const int val_int = datum_atoi_strict(val, strlen(val));
+		if (val_int == datum_config.clog_near_block_bits) return true;
+		if (val_int > 32 || val_int < 0) {
+			json_array_append_new(errors, json_string_nocheck("Near-block log margin must be between 0 and 32"));
+			return false;
+		}
+		datum_config.clog_near_block_bits = val_int;
+		datum_api_json_modify_new("logger", "near_block_bits", json_integer(val_int));
 	} else if (0 == strcmp(key, "bitcoind_rpcurl")) {
 		if (0 == strcmp(val, datum_config.bitcoind_rpcurl)) return true;
 		if (strlen(val) >= sizeof(datum_config.bitcoind_rpcurl)) {

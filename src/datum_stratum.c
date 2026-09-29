@@ -1247,6 +1247,18 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		}
 	}
 	
+	if (!was_block && datum_config.clog_near_block_bits > 0 && job->block_template &&
+	    (!job->is_datum_job || !job->block_template->abw_enabled)) {
+		int share_bits = 0, target_bits = 0;
+		if (datum_hash_is_near_target(share_hash, job->block_target, datum_config.clog_near_block_bits, &share_bits, &target_bits)) {
+			for(i=0;i<32;i++) {
+				uchar_to_hex(&new_notify_blockhash[(31-i)<<1], share_hash[i]);
+			}
+			new_notify_blockhash[64] = 0;
+			DLOG_WARN("NEAR BLOCK share from %s: %d leading zero bits (block needs %d) - %s", username_s, share_bits, target_bits, new_notify_blockhash);
+		}
+	}
+	
 	// For ABW work the XOR key is withheld, so only Apex can classify a
 	// network candidate before disclosure.
 	if (job->is_stale_prevblock) {

@@ -59,6 +59,8 @@ void build_hex_lookup(void);
 bool my_sha256(void *digest, const void *buffer, size_t length);
 void nbits_to_target(uint32_t nbits, uint8_t *target);
 int compare_hashes(const uint8_t *hash1, const uint8_t *hash2);
+int datum_hash_leading_zero_bits(const uint8_t *hash);
+bool datum_hash_is_near_target(const uint8_t *hash, const uint8_t *target, int margin_bits, int *hash_bits, int *target_bits);
 
 static inline long double datum_pdiff_to_bdiff(uint64_t n) {
 	return ((long double)n) * 65535.0L / 65536.0L;

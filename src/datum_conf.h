@@ -151,6 +151,7 @@ typedef struct {
 	bool clog_to_console;
 	int clog_level_console;
 	int clog_level_file;
+	int clog_near_block_bits;
 	bool clog_calling_function;
 	bool clog_to_stderr;
 	bool clog_rotate_daily;

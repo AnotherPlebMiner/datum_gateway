@@ -256,6 +256,30 @@ int compare_hashes(const uint8_t *share_hash, const uint8_t *target) {
 	return 0; // hashes are equal
 }
 
+// Count leading zero bits of a 256-bit little-endian hash/target (as compared by compare_hashes)
+int datum_hash_leading_zero_bits(const uint8_t *hash) {
+	int bits = 0;
+	for (int i = 31; i >= 0; i--) {
+		if (hash[i] == 0) {
+			bits += 8;
+			continue;
+		}
+		for (int b = 7; b >= 0 && !(hash[i] & (1 << b)); b--) bits++;
+		break;
+	}
+	return bits;
+}
+
+// True if hash misses target, but has at least (target's leading zero bits - margin_bits) leading zero bits
+bool datum_hash_is_near_target(const uint8_t *hash, const uint8_t *target, int margin_bits, int *hash_bits, int *target_bits) {
+	if (margin_bits <= 0 || compare_hashes(hash, target) <= 0) return false;
+	const int hb = datum_hash_leading_zero_bits(hash);
+	const int tb = datum_hash_leading_zero_bits(target);
+	if (hash_bits) *hash_bits = hb;
+	if (target_bits) *target_bits = tb;
+	return hb >= tb - margin_bits;
+}
+
 unsigned long long block_reward(unsigned int block_height) {
 	unsigned long long reward = 5000000000;
 	unsigned int halvings = block_height / 210000;

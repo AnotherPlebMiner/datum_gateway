@@ -1107,6 +1107,10 @@ static char *datum_protocol_abw_take_revealed_candidate_locked(
 			}
 		} else {
 			nbits_to_target(upk_u32le(pending->block_header, 72), target);
+			int share_bits = 0, target_bits = 0;
+			if (datum_hash_is_near_target(actual_pow_hash, target, datum_config.clog_near_block_bits, &share_bits, &target_bits)) {
+				DLOG_WARN("NEAR BLOCK ABW share (revealed): %d leading zero bits (block needs %d)", share_bits, target_bits);
+			}
 			if (compare_hashes(actual_pow_hash, target) > 0) {
 				datum_protocol_abw_pending_clear(pending);
 				continue;

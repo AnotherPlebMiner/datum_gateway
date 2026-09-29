@@ -202,6 +202,13 @@
 				</div>
 				<div class="setting-row">
 					<div class="flex-row">
+						<label for="logger_near_block_bits" class="label">Log near-block shares within (zero bits):</label>
+						<input maxlength="2" name="logger_near_block_bits" id="logger_near_block_bits" value="${logger_near_block_bits}"${*ro}></input>
+					</div>
+					<label for="logger_near_block_bits" class="tip">0-32. Logs a warning when a share has at least (block target zero bits - N) leading zero bits. 0 disables. 2 suggested.</label>
+				</div>
+				<div class="setting-row">
+					<div class="flex-row">
 						<label for="bitcoind_rpcurl" class="label">bitcoind RPC URL:</label>
 						<input maxlength="255" name="bitcoind_rpcurl" id="bitcoind_rpcurl" value="${bitcoind_rpcurl}"${*ro}></input>
 					</div>
