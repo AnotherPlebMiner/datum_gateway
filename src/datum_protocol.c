@@ -170,6 +170,7 @@ static bool datum_has_resume_token = false;
 static bool datum_requested_resume = false;
 static bool datum_connection_configured = false;
 static atomic_bool datum_pool_abw_enabled = true;
+#define DATUM_ABW_SHARE_ACCEPT_TIMEOUT_MS ((uint64_t)240000)
 
 extern DATUM_QUEUE pow_queue;
 
@@ -3112,12 +3113,14 @@ void *datum_protocol_client(void *args) {
 			break;
 		}
 		
-		// Sanity check.  If we've been sending shares but getting no acceptance for > 30 seconds, something is wrong and we should fail and start over
+		// Sanity check.  If we've been sending shares but getting no acceptance for too long, something is wrong and we should fail and start over
+		// With ABW the pool cannot acknowledge shares until it discloses the key (up to ~180 seconds), so allow much longer
 		if ((datum_last_accepted_share_tsms != 0) && (datum_last_accepted_share_local_tsms != 0)) {
 			if (datum_last_accepted_share_local_tsms > datum_last_accepted_share_tsms) {
-				if ((datum_last_accepted_share_local_tsms - datum_last_accepted_share_tsms) >= 30000) {
-					// no response to our latest share for > 30 seconds
-					DLOG_WARN("No share acceptance response for > 30 seconds.  Exiting protocol thread to retry.");
+				const uint64_t accept_timeout_ms = datum_protocol_abw_required() ? DATUM_ABW_SHARE_ACCEPT_TIMEOUT_MS : 30000;
+				if ((datum_last_accepted_share_local_tsms - datum_last_accepted_share_tsms) >= accept_timeout_ms) {
+					// no response to our latest share for too long
+					DLOG_WARN("No share acceptance response for > %u seconds.  Exiting protocol thread to retry.", (unsigned)(accept_timeout_ms / 1000));
 					break;
 				}
 			}
