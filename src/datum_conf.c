@@ -177,6 +177,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 		.required = false, .ptr = &datum_config.clog_level_file, .default_int = 1 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "logger",	.name = "near_block_bits",				.description = "Log shares whose hash is within this many leading zero bits of the block target (0=disabled)",
 		.required = false, .ptr = &datum_config.clog_near_block_bits, .default_int = 2 },
+	{ .var_type = DATUM_CONF_INT, 		.category = "logger",	.name = "hash_log_bits",				.description = "Log (at info level) the leading zero bits of every share within this many bits of the block target, for hash distribution analysis (0=disabled)",
+		.required = false, .ptr = &datum_config.clog_hash_log_bits, .default_int = 0 },
 	
 	// datum options
 	{ .var_type = DATUM_CONF_STRING, 	.category = "datum", 		.name = "pool_host",					.description = "Remote DATUM server host/ip to use for decentralized pooled mining (set to \"\" to disable pooled mining)",

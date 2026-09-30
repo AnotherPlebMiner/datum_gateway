@@ -1396,6 +1396,15 @@ bool datum_api_config_set(const char * const key, const char * const val, struct
 		}
 		datum_config.clog_near_block_bits = val_int;
 		datum_api_json_modify_new("logger", "near_block_bits", json_integer(val_int));
+	} else if (0 == strcmp(key, "logger_hash_log_bits")) {
+		const int val_int = datum_atoi_strict(val, strlen(val));
+		if (val_int == datum_config.clog_hash_log_bits) return true;
+		if (val_int > 64 || val_int < 0) {
+			json_array_append_new(errors, json_string_nocheck("Hash distribution log margin must be between 0 and 64"));
+			return false;
+		}
+		datum_config.clog_hash_log_bits = val_int;
+		datum_api_json_modify_new("logger", "hash_log_bits", json_integer(val_int));
 	} else if (0 == strcmp(key, "bitcoind_rpcurl")) {
 		if (0 == strcmp(val, datum_config.bitcoind_rpcurl)) return true;
 		if (strlen(val) >= sizeof(datum_config.bitcoind_rpcurl)) {

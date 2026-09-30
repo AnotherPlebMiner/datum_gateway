@@ -1117,6 +1117,9 @@ static char *datum_protocol_abw_take_revealed_candidate_locked(
 				hash_hex[64] = 0;
 				DLOG_WARN("NEAR BLOCK ABW share (revealed): %d leading zero bits (block needs %d) - %s", share_bits, target_bits, hash_hex);
 			}
+			if (datum_hash_is_near_target(actual_pow_hash, target, datum_config.clog_hash_log_bits, &share_bits, &target_bits)) {
+				DLOG_INFO("SHARE BITS ABW (revealed): %d leading zero bits (block needs %d)", share_bits, target_bits);
+			}
 			if (compare_hashes(actual_pow_hash, target) > 0) {
 				datum_protocol_abw_pending_clear(pending);
 				continue;

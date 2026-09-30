@@ -209,6 +209,13 @@
 				</div>
 				<div class="setting-row">
 					<div class="flex-row">
+						<label for="logger_hash_log_bits" class="label">Log share hash bits within (zero bits):</label>
+						<input maxlength="2" name="logger_hash_log_bits" id="logger_hash_log_bits" value="${logger_hash_log_bits}"${*ro}></input>
+					</div>
+					<label for="logger_hash_log_bits" class="tip">0-64. Logs an info line with the leading zero bits of each share having at least (block target zero bits - N), for building a hash distribution. 0 disables. 10 is a good starting point.</label>
+				</div>
+				<div class="setting-row">
+					<div class="flex-row">
 						<label for="bitcoind_rpcurl" class="label">bitcoind RPC URL:</label>
 						<input maxlength="255" name="bitcoind_rpcurl" id="bitcoind_rpcurl" value="${bitcoind_rpcurl}"${*ro}></input>
 					</div>
