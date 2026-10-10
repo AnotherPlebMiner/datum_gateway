@@ -35,8 +35,11 @@
 
 #include <assert.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sodium.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -44,6 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <string.h>
@@ -52,6 +56,12 @@
 #include <sys/time.h>
 #include <inttypes.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#elif defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#endif
 
 #include "datum_gateway.h"
 #include "datum_logger.h"
@@ -63,6 +73,7 @@
 unsigned int datum_test_failed = 0;
 volatile int panic_mode = 0;
 static uint64_t process_start_time = 0;
+char *datum_executable_path = NULL;
 
 bool datum_test_fail_(const char *expr, const char *file, unsigned int line, const char *func) {
 	fprintf(stderr, "ERROR: TEST FAILED at %s:%u (%s): %s\n", file, line, func, expr);
@@ -71,15 +82,30 @@ bool datum_test_fail_(const char *expr, const char *file, unsigned int line, con
 	return false;
 }
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+	#include <sanitizer/lsan_interface.h>
+	#define LSAN_IGNORE(ptr) __lsan_ignore_object(ptr)
+#else
+	#define LSAN_IGNORE(ptr) (void)(ptr)
+#endif
+
 uint64_t get_process_uptime_seconds() {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec - process_start_time;
 }
 
+static char *datum_get_executable_path(void);
+
 void datum_utils_init(void) {
 	build_hex_lookup();
 	process_start_time = monotonic_time_seconds();
+	datum_executable_path = datum_get_executable_path();
+	LSAN_IGNORE(datum_executable_path);
 }
 
 #ifdef __GNUC__
@@ -321,15 +347,14 @@ int append_bitcoin_varint_hex(uint64_t n, char *s) {
 	}
 }
 
-int append_UNum_hex(uint64_t n, char *s) {
+int append_UNum(uint64_t n, uint8_t *s) {
 	if (n == 0) {
-		memcpy(s, "00", 3); // OP_0
-		return 2;
+		s[0] = 0x00; // OP_0
+		return 1;
 	}
 	if (n <= 16) {
-		uchar_to_hex(s, (uint8_t)(0x50 + n)); // OP_1 through OP_16
-		s[2] = '\0';
-		return 2;
+		s[0] = (uint8_t)(0x50 + n); // OP_1 through OP_16
+		return 1;
 	}
 	
 	int count = 0;
@@ -341,29 +366,24 @@ int append_UNum_hex(uint64_t n, char *s) {
 		temp >>= 8;
 	} while (temp != 0);
 	
-	int len = 2;
-	uchar_to_hex(s, count);
+	s[0] = count;
 	
 	for (int i = 0; i < count; i++) {
-		uchar_to_hex(s+len, (uint8_t)(n & 0xFF));
+		s[i + 1] = (uint8_t)(n & 0xFF);
 		
 		last_msb = (n >= 0x80);
 		
 		n >>= 8;
-		len += 2;
 	}
 	
 	// if the last byte is >= 0x80, then we need to inject a zero at the end
 	if (last_msb) {
 		count++;
-		uchar_to_hex(s, count);
-		uchar_to_hex(s+len, 0);
-		len+=2;
+		s[0] = count;
+		s[count] = 0;
 	}
 	
-	s[len] = '\0';
-	
-	return len;
+	return count + 1;
 }
 
 void hex_to_bin_le(const char *hex, unsigned char *bin) {
@@ -378,6 +398,20 @@ void hex_to_bin(const char *hex, unsigned char *bin) {
 	for (size_t i = 0; i < len>>1; i++) {
 		bin[i] = hex2bin_uchar(&hex[(i<<1)]);
 	}
+}
+
+// pthread_create with a DATUM_THREAD_STACK_SIZE stack. Returns 0 or the error
+// number from pthread_attr_init, pthread_attr_setstacksize or pthread_create.
+int datum_thread_create(pthread_t *thread, void *(*start_routine)(void *), void *arg) {
+	pthread_attr_t attr;
+	int ret;
+	
+	ret = pthread_attr_init(&attr);
+	if (ret) return ret;
+	ret = pthread_attr_setstacksize(&attr, DATUM_THREAD_STACK_SIZE);
+	if (!ret) ret = pthread_create(thread, &attr, start_routine, arg);
+	pthread_attr_destroy(&attr);
+	return ret;
 }
 
 void panic_from_thread(int a) {
@@ -631,31 +665,38 @@ bool strncpy_uachars(char *out, const char *in, size_t maxlen) {
 	return true;
 }
 
-long double calc_network_difficulty(const char *bits_hex) {
-	// given a share solution in hex, calculate the network difficulty
-	// Postgres code for this (with hex_to_int added function)
-	// (pow(10,  ( (29-tpower_val)*2.4082399653118495617099111577959 ) + log( (65535 / tvalue_val) )   )  ) as network_difficulty
+bitcoin_difficulty_typ calc_network_difficulty_blake2b(uint32_t nbits) {
+	const unsigned int exponent = nbits >> 24;
+	const uint32_t mantissa = nbits & UINT32_C(0x00ffffff);
 	
-	char tpower[3];
-	char tvalue[7];
-	unsigned char tpower_val;
-	unsigned long tvalue_val;
-	char *ep;
-	int i;
-	long double d;
-	signed short s;
+	return ldexpl(1.0L, 280 - 8 * (int)exponent) / mantissa;
+}
+
+int datum_format_difficulty(char * const out, const size_t outsz, bitcoin_difficulty_typ diff) {
+	if (diff < 1000) {
+		return snprintf(out, outsz, "%"PRIdiff, diff);
+	}
 	
-	tpower[0] = bits_hex[0];
-	tpower[1] = bits_hex[1];
-	tpower[2] = 0;
+	static const char suffixes[] = "kMGTPEZYRQ";
+	const char *suffix = &suffixes[0];
 	
-	for(i=0;i<6;i++) tvalue[i] = bits_hex[2+i];
-	tvalue[6] = 0;
-	tpower_val = (unsigned char)strtoul(tpower, &ep, 16);
-	tvalue_val = strtoul(tvalue, &ep, 16);
-	s = (signed short)29 - (signed short)tpower_val;
-	d = powl(10.0,(double)s*(long double)2.4082399653118495617099111577959 + log10(65535.0 / (double)tvalue_val));
-	return d;
+	diff /= 1000;
+	while (diff >= 999.95L && suffix[1]) {
+		diff /= 1000;
+		++suffix;
+	}
+	return snprintf(out, outsz, "%.1Lf%c", diff, suffix[0]);
+}
+
+bool buf_datum_format_difficulty(struct buf * const buf, const bitcoin_difficulty_typ diff) {
+	char * const appendbuf = buf_preappend(buf, DATUM_FORMAT_DIFFICULTY_OUT_SZ);
+	if (!appendbuf) return false;
+	const int rv = datum_format_difficulty(appendbuf, DATUM_FORMAT_DIFFICULTY_OUT_SZ, diff);
+	if (rv < 0 || rv >= DATUM_FORMAT_DIFFICULTY_OUT_SZ) {
+		return buf_strcat(buf, "(err)");
+	}
+	buf->len += rv;
+	return true;
 }
 
 #define SIPHASH_ROTATE(a, b) ((uint64_t)(((a)<<(b))|((a)>>(64-(b)))))
@@ -819,6 +860,45 @@ char **datum_deepcopy_charpp(const char * const * const p) {
 	return out;
 }
 
+static
+char *datum_get_executable_path(void) {
+#ifdef __linux__
+	return realpath("/proc/self/exe", NULL);
+#elif defined(__APPLE__)
+	char path[PATH_MAX + 1];
+	uint32_t path_size = sizeof(path);
+	if (_NSGetExecutablePath(path, &path_size) != 0) {
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	return realpath(path, NULL);
+#elif defined(__FreeBSD__)
+	char path[PATH_MAX + 1];
+	size_t path_size = sizeof(path);
+	const int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]), path, &path_size, NULL, 0) != 0) {
+		return NULL;
+	}
+	if (!path_size || path_size > sizeof(path) || path[path_size - 1] != '\0' || !path[0]) {
+		errno = ENOENT;
+		return NULL;
+	}
+	return realpath(path, NULL);
+#else
+	errno = ENOSYS;
+	return NULL;
+#endif
+}
+
+int datum_reexec_check(void) {
+	if (!datum_executable_path) return ENOENT;
+	struct stat st;
+	if (stat(datum_executable_path, &st) != 0) return errno;
+	if (!S_ISREG(st.st_mode)) return EACCES;
+	if (faccessat(AT_FDCWD, datum_executable_path, X_OK, AT_EACCESS) != 0) return errno;
+	return 0;
+}
+
 void datum_reexec() {
 	// FIXME: kill other threads (except logging?) before closing fds
 	
@@ -846,7 +926,8 @@ void datum_reexec() {
 			" mounted?)", __func__);
 	}
 	
-	execv((void*)datum_argv[0], (void*)datum_argv);
+	assert(datum_executable_path);
+	execv(datum_executable_path, (void*)datum_argv);
 	// execv shouldn't return!
 	
 	DLOG_FATAL("Failed to restart! We're too deep in to recover!");
@@ -878,4 +959,36 @@ const char *dynamic_hash_unit(double * const inout_hashrate){
 	} else {
 		return "Th/s";
 	}
+}
+
+int buf_printf(struct buf * const buf, const char * const format, ...) {
+	if (buf->err) return -1;
+	
+	if (!buf->s) {
+		if (!buf_reserve(buf, 0x80)) return -1;
+	}
+	
+	const size_t available = buf->allocsz - buf->len;
+	
+	va_list ap;
+	va_start(ap, format);
+	int n = vsnprintf(&buf->s[buf->len], available, format, ap);
+	va_end(ap);
+	
+	if (n >= 0 && (size_t)n >= available) {
+		const size_t required = (size_t)n + 1;
+		void * const appendbuf = buf_preappend(buf, required);
+		if (!appendbuf) return -1;
+		
+		va_start(ap, format);
+		n = vsnprintf(appendbuf, required, format, ap);
+		va_end(ap);
+	}
+	
+	if (n < 0) {
+		buf->err = true;
+		return -1;
+	}
+	buf->len += (size_t)n;
+	return n;
 }

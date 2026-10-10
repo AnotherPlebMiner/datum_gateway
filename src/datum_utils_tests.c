@@ -35,10 +35,16 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include "datum_gateway.h"
 #include "datum_utils.h"
 
 void datum_utils_tests_hex_to_bin(const uint8_t c, char * const x, const char * const fmt) {
@@ -96,6 +102,20 @@ void datum_utils_tests_hex(void) {
 	}
 }
 
+static
+void datum_utils_tests_bytes_to_hex(void) {
+	const uint8_t bytes[] = {0x00, 0x12, 0xab, 0xff};
+	char hex[9];
+	
+	memset(hex, 0x0e, sizeof(hex));
+	datum_test(bytes_to_hex(hex, bytes, 0) == 0);
+	datum_test(hex[0] == 0x0e);
+	
+	datum_test(bytes_to_hex(hex, bytes, sizeof(bytes)) == 8);
+	datum_test(memcmp(hex, "0012abff", 8) == 0);
+	datum_test(hex[8] == 0x0e);
+}
+
 void datum_utils_tests_secure_strequals(void) {
 	const char * const secret = "abc";
 	const size_t secret_len = strlen(secret);
@@ -118,22 +138,22 @@ void datum_utils_tests_secure_strequals(void) {
 }
 
 void datum_utils_tests_scriptnum(void) {
-	char encoded[32];
+	uint8_t encoded[16];
 
-	datum_test(append_UNum_hex(0, encoded) == 2);
-	datum_test(!strcmp(encoded, "00"));
-	datum_test(append_UNum_hex(1, encoded) == 2);
-	datum_test(!strcmp(encoded, "51"));
-	datum_test(append_UNum_hex(16, encoded) == 2);
-	datum_test(!strcmp(encoded, "60"));
-	datum_test(append_UNum_hex(17, encoded) == 4);
-	datum_test(!strcmp(encoded, "0111"));
-	datum_test(append_UNum_hex(127, encoded) == 4);
-	datum_test(!strcmp(encoded, "017f"));
-	datum_test(append_UNum_hex(128, encoded) == 6);
-	datum_test(!strcmp(encoded, "028000"));
-	datum_test(append_UNum_hex(32768, encoded) == 8);
-	datum_test(!strcmp(encoded, "03008000"));
+	datum_test(append_UNum(0, encoded) == 1);
+	datum_test(encoded[0] == 0x00);
+	datum_test(append_UNum(1, encoded) == 1);
+	datum_test(encoded[0] == 0x51);
+	datum_test(append_UNum(16, encoded) == 1);
+	datum_test(encoded[0] == 0x60);
+	datum_test(append_UNum(17, encoded) == 2);
+	datum_test(!memcmp(encoded, "\x01\x11", 2));
+	datum_test(append_UNum(127, encoded) == 2);
+	datum_test(!memcmp(encoded, "\x01\x7f", 2));
+	datum_test(append_UNum(128, encoded) == 3);
+	datum_test(!memcmp(encoded, "\x02\x80\x00", 3));
+	datum_test(append_UNum(32768, encoded) == 4);
+	datum_test(!memcmp(encoded, "\x03\x00\x80\x00", 4));
 }
 
 static void datum_utils_tests_pdiff_to_bdiff(void) {
@@ -162,10 +182,104 @@ static void datum_utils_tests_near_target(void) {
 	datum_test(!datum_hash_is_near_target(hash, target, 0, NULL, NULL));
 }
 
+static void datum_utils_tests_network_difficulty_blake2b(void) {
+	const bitcoin_difficulty_typ difficulty = calc_network_difficulty_blake2b(UINT32_C(0x1702c4e4));
+	char formatted[DATUM_FORMAT_DIFFICULTY_OUT_SZ];
+	
+	datum_test(fabsl(difficulty / 4.3657653085953146e23L - 1.0L) < 1e-15L);
+	datum_test(datum_pdiff_to_diff(1) == 4294967296.0L);
+	datum_test(datum_pdiff_to_diff(DATUM_MAX_PDIFF) == ldexpl(1.0L, 95));
+	datum_test(datum_pdiff_to_diff(UINT64_MAX) > (bitcoin_difficulty_typ)UINT64_MAX);
+	datum_test(datum_format_difficulty(formatted, sizeof(formatted), datum_pdiff_to_diff(DATUM_MAX_PDIFF)) > 0);
+	datum_test(!strcmp(formatted, "39.6R"));
+	datum_test(datum_format_difficulty(formatted, sizeof(formatted), datum_pdiff_to_diff(1024)) > 0);
+	datum_test(!strcmp(formatted, "4.4T"));
+	datum_test(datum_format_difficulty(formatted, sizeof(formatted), 999950) > 0);
+	datum_test(!strcmp(formatted, "1.0M"));
+	datum_test(datum_format_difficulty(formatted, sizeof(formatted), difficulty) > 0);
+	datum_test(!strcmp(formatted, "436.6Z"));
+}
+
+static void datum_utils_tests_buf(void) {
+	struct buf buf = BUF_INIT;
+	char input[257];
+	
+	memset(input, 'x', sizeof(input) - 1);
+	input[sizeof(input) - 1] = '\0';
+	datum_test(buf_append(&buf, input, 0));
+	datum_test(buf_printf(&buf, "%s", input) == (int)strlen(input));
+	datum_test(buf.len == strlen(input));
+	datum_test(!memcmp(buf.s, input, buf.len));
+	datum_test(buf_nullterminate(&buf));
+	datum_test(buf.s[buf.len] == '\0');
+	free(buf.s);
+}
+
+/* Uses 1 MiB of stack, more than musl (128 KiB) and macOS (512 KiB) give a
+ * thread by default. */
+static void *datum_utils_tests_large_stack_thread(void *arg) {
+	volatile unsigned char buf[1024 * 1024];
+	
+	buf[0] = 1;
+	buf[sizeof(buf) - 1] = 2;
+	*(int *)arg = buf[0] + buf[sizeof(buf) - 1];
+	return NULL;
+}
+
+void datum_utils_tests_thread_stack(void) {
+	pthread_t thread;
+	int result = 0;
+	
+	if (datum_test(datum_thread_create(&thread, datum_utils_tests_large_stack_thread, &result) == 0)) {
+		datum_test(pthread_join(thread, NULL) == 0);
+		datum_test(result == 3);
+	}
+}
+
+static void datum_utils_tests_executable_path(void) {
+	datum_test(datum_reexec_check() == 0);
+	char * const path = datum_executable_path;
+	if (!datum_test(path != NULL)) return;
+	datum_test(path[0] == '/');
+	struct stat st;
+	if (datum_test(stat(path, &st) == 0)) {
+		datum_test(S_ISREG(st.st_mode));
+#ifdef __linux__
+		struct stat executable;
+		if (datum_test(stat("/proc/self/exe", &executable) == 0)) {
+			datum_test(st.st_dev == executable.st_dev && st.st_ino == executable.st_ino);
+		}
+#endif
+	}
+	datum_test(access(path, X_OK) == 0);
+
+	const pid_t child = fork();
+	if (!datum_test(child >= 0)) return;
+	if (!child) {
+		const char * const args[] = {"datum-gateway-invalid-argv0", "--example-conf", NULL};
+		datum_argv = args;
+		if (chdir("/") != 0 || !freopen("/dev/null", "w", stdout)) {
+			_exit(1);
+		}
+		datum_reexec();
+		_exit(1);
+	}
+	int status;
+	if (datum_test(waitpid(child, &status, 0) == child)) {
+		datum_test(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+}
+
 void datum_utils_tests(void) {
+	datum_utils_init();
 	datum_utils_tests_near_target();
 	datum_utils_tests_hex();
+	datum_utils_tests_bytes_to_hex();
 	datum_utils_tests_secure_strequals();
 	datum_utils_tests_scriptnum();
 	datum_utils_tests_pdiff_to_bdiff();
+	datum_utils_tests_network_difficulty_blake2b();
+	datum_utils_tests_buf();
+	datum_utils_tests_thread_stack();
+	datum_utils_tests_executable_path();
 }

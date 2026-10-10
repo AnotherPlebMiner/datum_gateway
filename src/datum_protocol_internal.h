@@ -48,14 +48,28 @@ extern unsigned char datum_state;
 extern int server_out_buf;
 extern unsigned char server_send_buffer[DATUM_PROTOCOL_BUFFER_SIZE];
 extern uint32_t sending_header_key;
+extern uint32_t receiving_header_key;
 extern unsigned char session_nonce_sender[crypto_box_NONCEBYTES];
+extern atomic_bool datum_framing_v2;
 extern atomic_bool datum_protocol_bulk_enabled;
 extern size_t datum_replay_count;
 extern atomic_uint_fast64_t datum_session_generation;
 extern unsigned char datum_protocol_next_job_idx;
 extern T_DATUM_PROTOCOL_JOB datum_jobs[MAX_DATUM_PROTOCOL_JOBS];
 
+// Scratch buffer for replies built on the protocol thread, and the most a
+// 0x50 0x11 reply may hold before its terminator and padding.
+#define DATUM_PROTOCOL_TEMP_DATA_SIZE (DATUM_PROTOCOL_MAX_CMD_DATA_SIZE + 16384)
+#define DATUM_STXLIST_REPLY_MAX (DATUM_PROTOCOL_MAX_CMD_DATA_SIZE - 113)
+extern unsigned char temp_data[DATUM_PROTOCOL_TEMP_DATA_SIZE];
+bool datum_protocol_stxlist_reply_fits(size_t offset, size_t txn_size);
+int datum_protocol_job_validation_stxlist_byid(const int len, const unsigned char * const data);
+int datum_protocol_job_validation_sblock(const int len, const unsigned char * const data);
+void datum_protocol_reset_server_knowledge(void);
+void datum_protocol_clear_validation_context(void);
+
 uint32_t datum_header_xor_feedback(uint32_t i);
+void datum_header_upk(T_DATUM_PROTOCOL_HEADER *h, const uint8_t *src, size_t offset, uint32_t *xor_key);
 int datum_protocol_flush_socket(int sockfd);
 void datum_protocol_bulk_reset(void);
 int datum_protocol_bulk_cmd_for_session(
@@ -87,6 +101,8 @@ int datum_protocol_abw_reveal(int len, unsigned char *data);
 
 int datum_protocol_mining_cmd(void *data, int len);
 int datum_protocol_client_configure(int len, unsigned char *data);
+int datum_protocol_send_hello(int sockfd);
+int datum_protocol_server_msg(T_DATUM_PROTOCOL_HEADER *header, unsigned char *data);
 int datum_protocol_mining_cmd5(
 	T_DATUM_PROTOCOL_HEADER *header, unsigned char *data);
 int datum_protocol_share_response(int len, unsigned char *data);

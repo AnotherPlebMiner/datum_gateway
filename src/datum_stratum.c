@@ -78,7 +78,7 @@ uint64_t stratum_latest_empty_job_index = 0;
 uint64_t stratum_latest_empty_sent_count = 0;
 
 pthread_rwlock_t need_coinbaser_rwlocks[MAX_STRATUM_JOBS];
-bool need_coinbaser_rwlocks_init_done = false;
+atomic_bool need_coinbaser_rwlocks_init_done = false;
 
 uint64_t stratum_client_accepted_share_count = 0;
 uint64_t stratum_client_accepted_share_diff = 0;
@@ -154,6 +154,7 @@ void *datum_stratum_v1_socket_server(void *arg) {
 	ram_allocated += sizeof(T_DATUM_SOCKET_APP);
 	
 	memset(app, 0, sizeof(T_DATUM_SOCKET_APP));
+	atomic_init(&app->datum_active_threads, 0);
 	
 	strcpy(app->name, "Stratum V1 Server");
 	
@@ -221,7 +222,7 @@ void *datum_stratum_v1_socket_server(void *arg) {
 	for (i = 0; i < MAX_STRATUM_JOBS; i++) {
 		pthread_rwlock_init(&need_coinbaser_rwlocks[i], NULL);
 	}
-	need_coinbaser_rwlocks_init_done = true;
+	atomic_store_explicit(&need_coinbaser_rwlocks_init_done, true, memory_order_release);
 	
 	// Backup thread for submitting blocks found to our node and additional nodes.
 	DLOG_DEBUG("Starting submitblock thread");
@@ -250,7 +251,7 @@ void *datum_stratum_v1_socket_server(void *arg) {
 	
 	// start the DATUM socket server
 	DLOG_DEBUG("Starting listener thread %p",app);
-	ret = pthread_create(&pthread_datum_stratum_socket_server, NULL, datum_gateway_listener_thread, app);
+	ret = datum_thread_create(&pthread_datum_stratum_socket_server, datum_gateway_listener_thread, app);
 	if (ret != 0) {
 		DLOG_FATAL("Could not pthread_create for DATUM socket listener!: %s", strerror(ret));
 		panic_from_thread(__LINE__);
@@ -376,10 +377,10 @@ void datum_stratum_v1_socket_thread_client_new(T_DATUM_CLIENT_DATA *c) {
 void datum_stratum_v1_socket_thread_init(T_DATUM_THREAD_DATA *my) {
 	T_DATUM_STRATUM_THREADPOOL_DATA *sdata = (T_DATUM_STRATUM_THREADPOOL_DATA *)my->app_thread_data;
 	
-	pthread_rwlock_rdlock(&stratum_global_job_ptr_lock);
-	sdata->latest_stratum_job_index = global_latest_stratum_job_index;
-	sdata->cur_stratum_job = global_cur_stratum_jobs[global_latest_stratum_job_index];
-	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
+	// No job yet: the first loop picks up the current job like any other job update,
+	// so it is processed (coinbaser readiness, etc) before any client here subscribes
+	sdata->latest_stratum_job_index = -1;
+	sdata->cur_stratum_job = NULL;
 	sdata->new_job = false;
 	sdata->last_sent_job_state = 0;
 	
@@ -404,12 +405,6 @@ int datum_stratum_v1_get_thread_subscriber_count(T_DATUM_THREAD_DATA *my) {
 
 bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job) {
 	bool a = false;
-	// backup timeout for coinbaser on these jobs
-	if ((sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
-		// enforce a timeout of 5 seconds on waiting on a coinbaser...
-		sdata->full_coinbase_ready = false;
-		return true;
-	}
 	
 	pthread_rwlock_rdlock(&need_coinbaser_rwlocks[job->global_index]);
 	if (!job->need_coinbaser) {
@@ -419,9 +414,18 @@ bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM
 	
 	if (a) {
 		sdata->full_coinbase_ready = true;
+		return true;
 	}
 	
-	return a;
+	// backup timeout for coinbaser on these jobs
+	// (only once we know it isn't here: this thread may be looking at the job late)
+	if ((sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
+		// enforce a timeout of 5 seconds on waiting on a coinbaser...
+		sdata->full_coinbase_ready = false;
+		return true;
+	}
+	
+	return false;
 }
 
 void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
@@ -851,8 +855,15 @@ void stratum_update_vardiff(T_DATUM_CLIENT_DATA *c, bool no_quick) {
 		
 		// reusing this var...
 		// try to set the difficulty quickly to a value that makes some sense based on how many shares we just saw
-		delta_tsms = roundDownToPowerOfTwo_64((target_ms_share / ms_per_share) * m->current_diff);
-		if (delta_tsms < (m->current_diff << 2)) {
+		const uint64_t diff_factor = target_ms_share / ms_per_share;
+		if (diff_factor > DATUM_MAX_PDIFF / m->current_diff) {
+			delta_tsms = DATUM_MAX_PDIFF;
+		} else {
+			delta_tsms = roundDownToPowerOfTwo_64(diff_factor * m->current_diff);
+		}
+		if (m->current_diff > DATUM_MAX_PDIFF >> 2) {
+			delta_tsms = DATUM_MAX_PDIFF;
+		} else if (delta_tsms < (m->current_diff << 2)) {
 			delta_tsms = (m->current_diff << 2);
 		}
 		
@@ -888,7 +899,7 @@ void stratum_update_vardiff(T_DATUM_CLIENT_DATA *c, bool no_quick) {
 	
 	if (ms_per_share < (target_ms_share/2)) {
 		// adjust diff upward a tick
-		m->current_diff = m->current_diff << 1;
+		if (m->current_diff < DATUM_MAX_PDIFF) m->current_diff <<= 1;
 		reset_vardiff_stats(c);
 		return;
 	}
@@ -1043,6 +1054,13 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	// 3 = ntime
 	// 4 = nonce
 	
+	T_DATUM_MINER_DATA * const m = c->app_client_data;
+	// Shares before subscribe share extranonce1=0 and have no job state.
+	if (!m || !m->subscribed) {
+		send_error_to_client(c, id, "[25,\"not-subscribed\",null]");
+		return 0;
+	}
+	
 	json_t *username;
 	json_t *extranonce2;
 	json_t *ntime;
@@ -1057,11 +1075,8 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	const char *nonce_s;
 	
 	uint16_t g_job_index;
-	uint32_t bver;
 	uint32_t ntime_val;
 	uint32_t nonce_val;
-	uint64_t ntime64 = 0;
-	uint64_t nonce64 = 0;
 	uint64_t check_time;
 	size_t ntime_len, nonce_len;
 	unsigned char ntime8[8] = {0};
@@ -1076,7 +1091,6 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	unsigned char block_header[80];
 	unsigned char share_hash[40];
 	unsigned char full_cb_txn[MAX_COINBASE_TXN_SIZE_BYTES];
-	T_DATUM_MINER_DATA * const m = c->app_client_data;
 	int i;
 	bool quickdiff;
 	bool empty_work;
@@ -1092,7 +1106,6 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	}
 	
 	// construct block header
-	bver = job->version_uint;
 	
 	// 36 - 67 = merkle root
 	// need to get the extranonce together
@@ -1118,6 +1131,14 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	if (!cb) {
 		send_unknown_work_error(c, id);
 		stratum_note_share(m, false, job_diff);
+		return 0;
+	}
+	
+	// Never-generated coinbase slots have coinb1_len==0; quickdiff patches at len-2.
+	if (cb->coinb1_len < 2) {
+		send_unknown_work_error(c, id);
+		m->share_count_rejected++;
+		m->share_diff_rejected += job_diff;
 		return 0;
 	}
 	
@@ -1155,7 +1176,6 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		for(i=0;i<8;i++) ntime8[i] = hex2bin_uchar(&ntime_s[i << 1]);
 		ntime_val = upk_u32le(ntime8, 0);
 	}
-	ntime64 = upk_u64le(ntime8, 0);
 	
 	// nonce
 	nonce = json_array_get(params_obj, 4);
@@ -1173,7 +1193,6 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		for(i=0;i<8;i++) nonce8[i] = hex2bin_uchar(&nonce_s[i << 1]);
 		nonce_val = upk_u32le(nonce8, 0);
 	}
-	nonce64 = upk_u64le(nonce8, 0);
 	
 	const size_t full_cb_txn_size =
 		(size_t)cb->coinb1_len + 12 + (size_t)cb->coinb2_len;
@@ -1310,8 +1329,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	}
 	
 	// check if duplicate submission
-	// if this is a quickdiff share, invert ntime here as a way to prevent unlikely collisions.
-	if (datum_stratum_check_for_dupe(m->sdata, nonce64, g_job_index, quickdiff?(~ntime64):(ntime64), bver, &extranonce_bin[0])) {
+	if (datum_stratum_check_for_dupe(m->sdata, share_hash, job->tsms)) {
 		send_rejected_duplicate(c, id);
 		stratum_note_share(m, false, job_diff);
 		return 0;
@@ -1789,7 +1807,7 @@ void stratum_calculate_merkle_branches(T_DATUM_STRATUM_JOB *s) {
 	// NOTE: This uses a static varaible for temp space. Do not call concurrently from multiple threads.
 	bool level_needs_dupe = false;
 	int current_level_size = 0, next_level_size = 0;
-	int q,i,j;
+	int q,i;
 	
 	// 64 byte combined hashes for inputs to merkle hashes
 	unsigned char combined[64];
@@ -1814,9 +1832,6 @@ void stratum_calculate_merkle_branches(T_DATUM_STRATUM_JOB *s) {
 	if (!s->block_template->txn_count) {
 		// no transactions
 		s->merklebranch_count = 0;
-		s->merklebranches_full[0] = '[';
-		s->merklebranches_full[1] = ']';
-		s->merklebranches_full[2] = 0;
 		return;
 	}
 	
@@ -1841,10 +1856,6 @@ void stratum_calculate_merkle_branches(T_DATUM_STRATUM_JOB *s) {
 				if (!q) {
 					// first level branch
 					memcpy(s->merklebranches_bin[0], s->block_template->txns[0].txid_bin, 32);
-					for(j=0;j<32;j++) {
-						pk_u16le(s->merklebranches_hex[0], j << 1, upk_u16le(s->block_template->txns[0].txid_hex, (31 - j) << 1));
-					}
-					s->merklebranches_hex[0][64] = 0;
 				} else {
 					// second+ level branch
 					if (level_needs_dupe && (i==(next_level_size-1))) {
@@ -1852,7 +1863,6 @@ void stratum_calculate_merkle_branches(T_DATUM_STRATUM_JOB *s) {
 					} else {
 						memcpy(s->merklebranches_bin[q], &current_level[(i<<1)+1][0], 32);
 					}
-					hash2hex(s->merklebranches_bin[q], s->merklebranches_hex[q]);
 				}
 			} else {
 				if (!q) {
@@ -1879,26 +1889,11 @@ void stratum_calculate_merkle_branches(T_DATUM_STRATUM_JOB *s) {
 				double_sha256(next_level[i], combined, 64);
 			}
 		}
-		current_level = next_level;
-		next_level+=i+1;
 		current_level_size = next_level_size;
 		q++;
 	}
 	
 	s->merklebranch_count = q;
-	
-	// Pre-construct stratum v1 job field
-	s->merklebranches_full[0] = '[';
-	j=1;
-	for(i=0;i<q;i++) {
-		if (i) {
-			s->merklebranches_full[j] = ',';
-			j++;
-		}
-		j += sprintf(&s->merklebranches_full[j], "\"%s\"", s->merklebranches_hex[i]);
-	}
-	s->merklebranches_full[j] = ']';
-	s->merklebranches_full[j+1] = 0;
 	
 	if (safety_check != marker) {
 		DLOG_FATAL("BUG: stratum_calculate_merkle_branches is NOT thread safe and appears to have been called concurrently!");
@@ -2022,12 +2017,8 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	s->version_uint = block_template->version;
 	strncpy(s->nbits, block_template->bits, sizeof(s->nbits) - 1);
 	
-	// TODO: Should we use local time, and just verify is valid for the block?
-	// Perhaps as an option.
-	// The template's time is 100% safe, so we'll use that for now.
 	memset(ntime8, 0, sizeof(ntime8));
 	s->blake2b_flags = datum_config.mining_allow_hasher_time_rolling ? DATUM_BLAKE2B_USE_TIME_OFFSET : 0;
-	pk_u32le(ntime8, 4, (uint32_t)block_template->curtime);
 	for(i=0;i<8;i++) {
 		uchar_to_hex(&s->ntime[i << 1], ntime8[i]);
 	}
@@ -2252,7 +2243,6 @@ int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t 
 	CURL *tcurl;
 	int ret = 0;
 	bool free_submitblock_req = false;
-	char *s = NULL;
 	unsigned char v2hdr[DATUM_BLAKE2B_BLOCK_HEADER_SIZE];
 	unsigned char merkle[32];
 	unsigned char en[12];
@@ -2375,32 +2365,10 @@ int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t 
 	// make the call!
 	r = bitcoind_json_rpc_call(tcurl, &datum_config, submitblock_req);
 	curl_easy_cleanup(tcurl);
-	if (!r) {
-		// Didn't get a usable response at all: either the request never reached the node, or it
-		// returned something we couldn't parse as a valid JSON-RPC reply, or a genuine top-level
-		// JSON-RPC error occurred. In every case we genuinely don't know if the block was
-		// accepted -- don't claim success. The dedicated submitblock thread triggered above is
-		// still independently submitting this same block.
-		DLOG_ERROR("Did not get a valid response submitting block %s! It may or may not have been accepted -- check your node!", block_hash_hex);
-		ret = 0;
-	} else {
-		json_t * const res_val = json_object_get(r, "result");
-		if (json_is_null(res_val)) {
-			// a null result means success here
-			DLOG_INFO("Block %s submitted to upstream node successfully!",block_hash_hex);
-			ret = 1;
-		} else {
-			s = json_dumps(res_val, JSON_ENCODE_ANY);
-			if (!s) {
-				DLOG_WARN("Upstream node rejected our block! (unknown)");
-			} else {
-				DLOG_WARN("Upstream node rejected our block! (%s)",s);
-				free(s);
-			}
-			ret = 0;
-		}
-		json_decref(r);
-	}
+	// The dedicated submitblock thread triggered above is still independently
+	// submitting this same block, so one of the two is answered "duplicate".
+	ret = datum_submitblock_log_reply(r, block_hash_hex) ? 1 : 0;
+	if (r) json_decref(r);
 	
 	// cleanup
 	if (free_submitblock_req) {

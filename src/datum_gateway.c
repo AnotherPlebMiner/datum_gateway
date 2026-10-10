@@ -81,6 +81,7 @@ struct arguments {
 	char *config_file;
 };
 
+void datum_api_tests(void);
 void datum_blocktemplates_tests(void);
 void datum_coinbaser_tests(void);
 void datum_stratum_tests(void);
@@ -112,6 +113,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 		case 0x101:  // test
 			datum_utils_tests();
 			datum_conf_tests();
+#ifdef ENABLE_API
+			datum_api_tests();
+#endif
 			datum_blocktemplates_tests();
 			datum_coinbaser_tests();
 			datum_parent_fetch_tests();
@@ -196,7 +200,12 @@ int main(const int argc, const char * const * const argv) {
 	datum_gateway_config_filename = arguments.config_file;
 	
 	// Initialize logger thread
-	datum_logger_init();
+	if (datum_logger_init()) {
+		DLOG_FATAL("Error initializing the logger!");
+		exit(1);
+	}
+	
+	datum_conf_check_warnings();
 	
 	if (datum_protocol_init()) {
 		DLOG_FATAL("Error initializing the DATUM protocol!");
@@ -237,11 +246,11 @@ int main(const int argc, const char * const * const argv) {
 	}
 	
 	DLOG_DEBUG("Starting template fetcher thread");
-	pthread_create(&pthread_datum_gateway_template, NULL, datum_gateway_template_thread, NULL);
+	datum_thread_create(&pthread_datum_gateway_template, datum_gateway_template_thread, NULL);
 	
 	// Note: The stratum thread will wait for a template to be available for some time before panicking.
 	DLOG_DEBUG("Starting Stratum v1 server");
-	pthread_create(&pthread_datum_stratum_v1, NULL, datum_stratum_v1_socket_server, NULL);
+	datum_thread_create(&pthread_datum_stratum_v1, datum_stratum_v1_socket_server, NULL);
 	
 	// Randomize the reconnect delay from 5 to 20 seconds to prevent hammering the server
 	next_reconnect_attempt_ms = ( 5000 + (rand() % 15001) );

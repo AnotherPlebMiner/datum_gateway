@@ -41,12 +41,14 @@
 #define DATUM_MAX_SUBMIT_URL_LEN 512
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <jansson.h>
 
 #include "datum_blocktemplates.h"
 #include "datum_coinbaser.h"
+#include "datum_utils.h"
 
 enum datum_conf_vartype {
 	// NOTE: Keep in sync with datum_conf_var_type_text
@@ -55,6 +57,7 @@ enum datum_conf_vartype {
 	DATUM_CONF_STRING,
 	DATUM_CONF_STRING_ARRAY,
 	DATUM_CONF_USERNAME_MODS,
+	DATUM_CONF_DIFFICULTY,
 };
 
 typedef struct {
@@ -80,6 +83,7 @@ typedef struct {
 
 const T_DATUM_CONFIG_ITEM *datum_config_get_option_info(const char *category, size_t category_len, const char *name, size_t name_len);
 const T_DATUM_CONFIG_ITEM *datum_config_get_option_info2(const char *category, const char *name);
+int datum_config_parse_difficulty(int *out, json_t *item);
 
 struct datum_addr_range {
 	char *addr;
@@ -167,7 +171,6 @@ typedef struct {
 	int datum_pool_migration_max_seconds;
 	bool datum_pool_pass_workers;
 	bool datum_pool_pass_full_users;
-	bool datum_always_pay_self;
 	bool datum_pooled_mining_only;
 	char datum_pool_pubkey[1024];
 	int datum_protocol_global_timeout;
@@ -183,7 +186,34 @@ typedef struct {
 extern global_config_t datum_config;
 
 int datum_read_config(const char *conffile);
+void datum_conf_check_warnings(void);
 void datum_gateway_help(const char *argv0);
 void datum_gateway_example_conf(void);
+
+static inline
+size_t datum_expected_n_global_nonstale_shares(const global_config_t * const cfg) {
+	// NOTE: If we use size_t too early, 32-bit gets capped at a mere 71 MB
+	uint64_t job_stale_seconds;
+	uint64_t c = 0;
+	bool overflow =
+		ckd_add(&job_stale_seconds, cfg->stratum_v1_share_stale_seconds, cfg->bitcoind_work_update_seconds) ||
+		ckd_mul(&c, cfg->stratum_v1_max_clients_per_thread,
+		               cfg->stratum_v1_vardiff_target_shares_min) ||
+		ckd_mul(&c, c, job_stale_seconds) ||
+		ckd_mul(&c, c, 16) ||
+		ckd_add(&c, c, 59);
+	c /= 60;  // seconds per minute
+	overflow |= (c > SIZE_MAX);  // check *after* division
+	
+	// The floor is because stratum.max_clients_per_thread is range checked for an upper
+	// bound and not a lower one, and this is the product of three configured values. A zero
+	// or a negative sizes the table at nothing, and nothing is not a table that merely
+	// overflows quickly: the expand grows it by 25%, 25% of zero is zero, and the gateway
+	// takes a share it then has nowhere to put. Sixteen is also the point below which the
+	// same rounding stops the table growing at all.
+	if (c < 16) c = 16;
+	
+	return overflow ? 0 : (size_t)c;
+}
 
 #endif
