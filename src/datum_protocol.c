@@ -1311,6 +1311,10 @@ unsigned char *datum_coinbaser_v2_response = NULL;
 unsigned char datum_coinbaser_v2_response_buf_idx = 0;
 uint64_t datum_coinbaser_v2_response_value[2] = { 0, 0 };
 int datum_coinbaser_v2_response_len[2] = { 0, 0 };
+// For logging only: when the last coinbaser request went out, its value, and whether the coinbaser thread is waiting for the answer
+static _Atomic uint64_t datum_coinbaser_req_tsms = 0;
+static _Atomic uint64_t datum_coinbaser_req_value = 0;
+static _Atomic int datum_coinbaser_waiting = 0;
 
 static int datum_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *timeout) {
 #ifndef HAVE_PTHREAD_MUTEX_TIMEDLOCK
@@ -1363,6 +1367,21 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	}
 	
 	// mutex is locked
+	{
+		// Log every coinbaser answer we receive, including late and unsolicited ones, with how long after the request it came
+		const uint64_t now_ms = current_time_millis();
+		const uint64_t req_value = atomic_load(&datum_coinbaser_req_value);
+		const uint64_t req_ms = atomic_load(&datum_coinbaser_req_tsms);
+		const bool matches = (v == req_value);
+		const long long after_ms = (matches && req_ms) ? (long long)(now_ms - req_ms) : -1;
+		if (matches && atomic_load(&datum_coinbaser_waiting)) {
+			DLOG_INFO("Coinbaser response received: value %"PRIu64" sats, %u bytes, %lld ms after the request", v, (unsigned)x, after_ms);
+		} else if (matches) {
+			DLOG_WARN("Coinbaser response received LATE: value %"PRIu64" sats, %u bytes, %lld ms after the request. The gateway had already stopped waiting, so this answer is not used for that job", v, (unsigned)x, after_ms);
+		} else {
+			DLOG_INFO("Coinbaser response for a different value: %"PRIu64" sats, %u bytes (last request was for %"PRIu64" sats); not for the waiting job, ignored", v, (unsigned)x, req_value);
+		}
+	}
 	if (datum_coinbaser_v2_response_buf_idx == 0) {
 		datum_coinbaser_v2_response_buf_idx = 1;
 	} else {
@@ -1417,12 +1436,17 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	// The send only appends to the outgoing buffer; it never blocks on the socket.
 	pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
 	datum_coinbaser_v2_response = NULL;
+	atomic_store(&datum_coinbaser_req_value, value);
+	atomic_store(&datum_coinbaser_req_tsms, current_time_millis());
+	atomic_store(&datum_coinbaser_waiting, 1);
 	
 	if (datum_protocol_mining_cmd_for_session(
 		msg, i, session_generation) != 0) {
+		atomic_store(&datum_coinbaser_waiting, 0);
 		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 		return 0;
 	}
+	DLOG_DEBUG("Coinbaser request sent for %"PRIu64" sats", value);
 	
 	// wait here for up to 5 seconds for a coinbaser response from the DATUM server
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -1433,9 +1457,10 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	       (datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] != value)) {
 		rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
 		if (rc != 0) {
+			atomic_store(&datum_coinbaser_waiting, 0);
 			pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 			if (rc == ETIMEDOUT) {
-				DLOG_DEBUG("Timeout waiting for coinbaser response from DATUM server");
+				DLOG_DEBUG("Timeout waiting for coinbaser response from DATUM server (%"PRIu64" ms since the request, value %"PRIu64" sats)", current_time_millis() - atomic_load(&datum_coinbaser_req_tsms), value);
 			} else {
 				DLOG_DEBUG("Error waiting for coinbaser response from DATUM server: %s", strerror(rc));
 			}
@@ -1447,8 +1472,10 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	// process received coinbase
 	if ((datum_coinbaser_v2_response) && (datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] == value)) {
 		i = datum_coinbaser_v2_parse(s, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx]);
+		DLOG_INFO("Coinbaser split used for this job: %d outputs, %"PRIu64" ms after the request", i, current_time_millis() - atomic_load(&datum_coinbaser_req_tsms));
 	}
 	
+	atomic_store(&datum_coinbaser_waiting, 0);
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 	return i;
 }
