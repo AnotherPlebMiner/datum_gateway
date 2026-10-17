@@ -2060,11 +2060,21 @@ int datum_protocol_share_response(const int len, unsigned char * const data) {
 		case DATUM_POW_SHARE_RESPONSE_REJECTED: {
 			const unsigned int reject_reason = upk_u16le(data, 1);
 			const enum datum_loglevel loglevel = (reject_reason == DATUM_REJECT_STALE_BLOCK) ? DLOG_LEVEL_DEBUG : DLOG_LEVEL_ERROR;
-			DLOG(loglevel, "DATUM server rejected our share!  Reason: %s (%u) / TargetPOT: %2.2x / Job ID: %u / Nonce: %8.8x",
+			// ABW responses echo the share's raw (masked) PoW hash; show it big-endian like the other hash lines
+			char raw_hash_hex[65] = "";
+			if (exact_abw_reference) {
+				for (int j = 0; j < 32; ++j) {
+					uchar_to_hex(&raw_hash_hex[(31 - j) << 1], data[11 + j]);
+				}
+				raw_hash_hex[64] = 0;
+			}
+			DLOG(loglevel, "DATUM server rejected our share!  Reason: %s (%u) / TargetPOT: %2.2x / Job ID: %u / Nonce: %8.8x%s%s",
 			           datum_protocol_share_reject_reason_name(reject_reason), reject_reason,
 			           target_pot,
 			           job_id,
-			           nonce);
+			           nonce,
+			           exact_abw_reference ? " / Raw hash: " : "",
+			           raw_hash_hex);
 			
 			++datum_rejected_share_count;
 			if (target_pot != 0xFF) {
