@@ -1183,6 +1183,15 @@ static char *datum_protocol_abw_take_revealed_candidate_locked(
 				uchar_to_hex(&hash_hex[(31 - j) << 1], actual_pow_hash[j]);
 			}
 			hash_hex[64] = 0;
+			// One line per revealed share, so a rejected share can be matched (by nonce / job) to the hash it really had.
+			char raw_hex[65];
+			for (int j = 0; j < 32; ++j) {
+				uchar_to_hex(&raw_hex[(31 - j) << 1], pending->raw_pow_hash[j]);
+			}
+			raw_hex[64] = 0;
+			DLOG_DEBUG("ABW REVEAL: Nonce: %8.8"PRIx32" / Job ID: %u / TargetPOT: %2.2x / Slot: %u / %d leading zero bits / Hash: %s / Raw hash: %s",
+			           pending->nonce, (unsigned)pending->job_id, pending->target_pot,
+			           (unsigned)(assignment_id - 1), datum_hash_leading_zero_bits(actual_pow_hash), hash_hex, raw_hex);
 			if (datum_hash_is_near_target(actual_pow_hash, target, datum_config.clog_near_block_bits, &share_bits, &target_bits)) {
 				DLOG_WARN("NEAR BLOCK ABW share (revealed): %d leading zero bits (block needs %d) - %s", share_bits, target_bits, hash_hex);
 			}
@@ -2767,6 +2776,18 @@ int datum_protocol_pow_submit(
 	}
 	
 	//DLOG_DEBUG("ADD: DATUM POW: time %d nonce %8.8X", pow.ntime, pow.nonce);
+	
+	if (pow.abw_assignment_id) {
+		// The pool answers by nonce / job id only, so keep the masked hash we sent to match it up later.
+		char raw_hex[65];
+		for (int j = 0; j < 32; ++j) {
+			uchar_to_hex(&raw_hex[(31 - j) << 1], pow.raw_pow_hash[j]);
+		}
+		raw_hex[64] = 0;
+		DLOG_DEBUG("ABW SUBMIT: Nonce: %8.8"PRIx32" / Job ID: %u / TargetPOT: %2.2x / Coinbase ID: %u / Slot: %u / Raw hash: %s",
+		           (uint32_t)pow.nonce, (unsigned)pow.datum_job_id, pow.target_byte,
+		           (unsigned)pow.coinbase_id, (unsigned)(pow.abw_assignment_id - 1), raw_hex);
+	}
 	
 	const int queued = datum_queue_add_item(&pow_queue, &pow);
 	if (queued != 0 && pow.abw_assignment_id) {
