@@ -226,6 +226,23 @@ static void datum_blake2b_coinbase_selection_tests(void) {
 	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 3);
 	miner.coinbase_selection = MAX_COINBASE_TYPES;
 	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 0);
+	
+	// A provisional split is built into every class at creation: the opening
+	// job of a new block, and work before the coinbaser is ready, serve the
+	// miner's class (full template) rather than the pool-only empty job or class 0.
+	miner.coinbase_selection = 4;
+	job.provisional_split = true;
+	job.job_state = JOB_STATE_EMPTY_PLUS;
+	sdata->full_coinbase_ready = false;
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, true) == 4);
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 4);
+	miner.coinbase_selection = MAX_COINBASE_TYPES;
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, true) == DATUM_COINBASE_ID_EMPTY);
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 0);
+	job.provisional_split = false;
+	miner.coinbase_selection = 4;
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, true) == DATUM_COINBASE_ID_EMPTY);
+	datum_test(datum_stratum_coinbase_index(sdata, &miner, false) == 0);
 	free(sdata);
 }
 

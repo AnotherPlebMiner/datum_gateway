@@ -978,6 +978,109 @@ static void datum_protocol_resume_tests(void) {
 	server_out_buf = buffered_before;
 }
 
+static void datum_coinbaser_reuse_test_save(T_DATUM_STRATUM_JOB *job, const unsigned char *tip, uint64_t value, unsigned char id) {
+	memset(job, 0, sizeof(*job));
+	memcpy(job->prevhash_bin, tip, 32);
+	job->coinbase_value = value;
+	job->datum_coinbaser_id = id;
+	job->available_coinbase_outputs_count = 2;
+	job->available_coinbase_outputs[0].value_sats = value / 4;
+	job->available_coinbase_outputs[1].value_sats = value - value / 4;
+	job->available_coinbase_outputs[0].output_script_len = 22;
+	job->available_coinbase_outputs[1].output_script_len = 22;
+	datum_protocol_coinbaser_save_good(job, 2);
+}
+
+static void datum_coinbaser_reuse_pool_and_late_tests(void) {
+	T_DATUM_STRATUM_JOB job;
+	unsigned char tip_a[32], tip_b[32], got[32];
+	unsigned char resp[12 + 1 + 2 * (8 + 1 + 22)];
+	const uint64_t saved_prime = datum_config.prime_id;
+	const uint64_t gen = atomic_load(&datum_session_generation);
+	size_t k;
+	int o;
+
+	memset(tip_a, 0xaa, 32);
+	memset(tip_b, 0xbb, 32);
+	datum_protocol_coinbaser_reuse_reset();
+	datum_test(!datum_protocol_coinbaser_have_saved());
+
+	// Exact tip and value in the same session restores the pool's coinbaser id.
+	datum_config.prime_id = 0x1111;
+	datum_coinbaser_reuse_test_save(&job, tip_a, 400000000, 7);
+	datum_test(datum_protocol_coinbaser_have_saved());
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 400000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.datum_coinbaser_id == 7);
+
+	// A stretched split does not claim the pool's id.
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 800000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.datum_coinbaser_id == 0);
+	datum_test(job.available_coinbase_outputs[0].value_sats + job.available_coinbase_outputs[1].value_sats == 800000000);
+
+	// A new session keeps the stretched reuse but not the id.
+	atomic_store(&datum_session_generation, gen + 1);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 400000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.datum_coinbaser_id == 0);
+	atomic_store(&datum_session_generation, gen);
+
+	// Another pool's split is never reused.
+	datum_config.prime_id = 0x2222;
+	datum_test(!datum_protocol_coinbaser_have_saved());
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 400000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_test(job.available_coinbase_outputs_count == 0);
+
+	// A late answer to the last request is saved, with its id, for its tip and value.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_test(datum_protocol_coinbaser_take_late(got) == 0);
+	k = 0;
+	pk_u64le(resp, k, 500000000); k += 8;
+	pk_u32le(resp, k, (uint32_t)(sizeof(resp) - 12)); k += 4;
+	resp[k++] = 9; // coinbaser id
+	for (o = 0; o < 2; o++) {
+		pk_u64le(resp, k, 250000000); k += 8;
+		resp[k++] = 22;
+		resp[k] = 0x00; resp[k + 1] = 0x14;
+		memset(&resp[k + 2], 0x30 + o, 20);
+		k += 22;
+	}
+	pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
+	datum_protocol_coinbaser_note_request(500000000, tip_b, gen);
+	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+	datum_test(datum_protocol_coinbaser_take_late(got) == 0); // nothing arrived yet
+	datum_test(datum_protocol_coinbaser_fetch_response((int)sizeof(resp), resp) == 1);
+	memset(got, 0, 32);
+	datum_test(datum_protocol_coinbaser_take_late(got) == 2);
+	datum_test(memcmp(got, tip_b, 32) == 0);
+	datum_test(datum_protocol_coinbaser_take_late(got) == 0); // consumed
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 500000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.datum_coinbaser_id == 9);
+
+	// An answer for another value is not taken as the late answer.
+	pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
+	datum_protocol_coinbaser_note_request(600000000, tip_b, gen);
+	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+	datum_test(datum_protocol_coinbaser_fetch_response((int)sizeof(resp), resp) == 1);
+	datum_test(datum_protocol_coinbaser_take_late(got) == 0);
+
+	datum_protocol_coinbaser_reuse_reset();
+	datum_config.prime_id = saved_prime;
+}
+
 static void datum_coinbaser_reuse_same_tip_tests(void) {
 	T_DATUM_STRATUM_JOB job;
 	unsigned char tip_a[32];
@@ -1709,6 +1812,7 @@ void datum_protocol_tests(void) {
 	datum_protocol_acceptance_watchdog_tests();
 	datum_protocol_config_v3_tests();
 	datum_coinbaser_reuse_same_tip_tests();
+	datum_coinbaser_reuse_pool_and_late_tests();
 	datum_protocol_migration_tests();
 	datum_protocol_bulk_tests();
 	datum_protocol_resume_tests();

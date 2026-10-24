@@ -1369,46 +1369,88 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 /* Last successful multi-out coinbaser.
  * Same tip and same value: exact reuse.
  * Same tip with a new value, or a new tip: stretch the last list onto the
- * job's coinbase value so miners are not left on an empty split. */
+ * job's coinbase value so miners are not left on an empty split.
+ * A split is only reused for the pool that dictated it (prime_id), and its
+ * coinbaser id is only restored on an exact match within the same session,
+ * since ids are per session. */
 static T_DATUM_TXN_OUTPUT datum_last_good_cb_outs[512];
 static int datum_last_good_cb_count = 0;
 static unsigned char datum_last_good_prevhash[32];
 static uint64_t datum_last_good_cb_value = 0;
+static unsigned char datum_last_good_cb_id = 0;
+static uint64_t datum_last_good_session = 0;
+static uint64_t datum_last_good_prime_id = 0;
+static char datum_last_good_pool_pubkey[sizeof(datum_config.datum_pool_pubkey)];
 static pthread_mutex_t datum_last_good_cb_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* The last request this gateway sent, so an answer that lands after the
+ * fetch stopped waiting can still be applied (see coinbaser_take_late). */
+static uint64_t datum_last_req_value = 0;
+static unsigned char datum_last_req_prevhash[32];
+static uint64_t datum_last_req_session = 0;
+static bool datum_last_req_unanswered = false;
+
 #define DATUM_COINBASER_FAST_WAIT_NS 500000000L /* 500ms */
+
+static bool datum_last_good_matches_pool_locked(void) {
+	return datum_last_good_cb_count >= 2 && datum_last_good_prime_id == datum_config.prime_id &&
+		strcmp(datum_last_good_pool_pubkey, datum_config.datum_pool_pubkey) == 0;
+}
+
+bool datum_protocol_coinbaser_have_saved(void) {
+	bool r;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	r = datum_last_good_matches_pool_locked();
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	return r;
+}
+
+/* Exact match: same pool, same session, same tip, same value. The saved
+ * split is the pool's own answer for this job, coinbaser id included. */
+static int datum_protocol_coinbaser_try_exact(T_DATUM_STRATUM_JOB *s) {
+	int n = 0;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	if (datum_last_good_matches_pool_locked() &&
+	    datum_last_good_session == atomic_load(&datum_session_generation) &&
+	    datum_last_good_cb_value == s->coinbase_value &&
+	    memcmp(datum_last_good_prevhash, s->prevhash_bin, 32) == 0) {
+		memcpy(s->available_coinbase_outputs, datum_last_good_cb_outs,
+		       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
+		s->available_coinbase_outputs_count = datum_last_good_cb_count;
+		s->datum_coinbaser_id = datum_last_good_cb_id;
+		n = datum_last_good_cb_count;
+	}
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	return n;
+}
 
 int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	int n = 0;
 	int i;
-	bool same_tip = false;
-	uint64_t old_value = 0;
 	uint64_t new_value = 0;
 	uint64_t total = 0;
 	uint64_t assigned = 0;
 	if (!s) return 0;
 	new_value = s->coinbase_value;
+	if (new_value == 0) return 0;
+	n = datum_protocol_coinbaser_try_exact(s);
+	if (n >= 2) {
+		DLOG_INFO("Coinbaser: using the pool's split for this tip and value (%d outs, id %u)", n, (unsigned)s->datum_coinbaser_id);
+		return n;
+	}
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
-	if (datum_last_good_cb_count >= 2) {
-		same_tip = (memcmp(datum_last_good_prevhash, s->prevhash_bin, 32) == 0);
-		old_value = datum_last_good_cb_value;
+	if (datum_last_good_matches_pool_locked()) {
 		memcpy(s->available_coinbase_outputs, datum_last_good_cb_outs,
 		       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
 		s->available_coinbase_outputs_count = datum_last_good_cb_count;
 		n = datum_last_good_cb_count;
 	}
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
-	if (n < 2) return 0;
-
-	if (same_tip && old_value != 0 && old_value == new_value) {
-		DLOG_INFO("Coinbaser miss: reusing last good multi-out (%d outs) for same prevhash", n);
-		return n;
-	}
-
-	if (new_value == 0) {
+	if (n < 2) {
 		s->available_coinbase_outputs_count = 0;
 		return 0;
 	}
+
 	for (i = 0; i < n; i++) {
 		total += s->available_coinbase_outputs[i].value_sats;
 	}
@@ -1417,9 +1459,8 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 		return 0;
 	}
 	if (total != new_value) {
-		assigned = 0;
 		for (i = 0; i < n; i++) {
-			uint64_t scaled = (s->available_coinbase_outputs[i].value_sats * new_value) / total;
+			uint64_t scaled = (uint64_t)(((unsigned __int128)s->available_coinbase_outputs[i].value_sats * new_value) / total);
 			s->available_coinbase_outputs[i].value_sats = scaled;
 			assigned += scaled;
 		}
@@ -1427,9 +1468,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 			s->available_coinbase_outputs[n - 1].value_sats += (new_value - assigned);
 		}
 	}
-	DLOG_INFO("Coinbaser miss: %s multi-out (%d outs) old_value=%" PRIu64 " → %" PRIu64,
-		same_tip ? "rescaling same-tip" : "cross-tip rescale",
-		n, old_value, new_value);
+	DLOG_INFO("Coinbaser: provisional split, last split stretched (%d outs) %" PRIu64 " -> %" PRIu64, n, total, new_value);
 	return n;
 }
 
@@ -1441,6 +1480,10 @@ void datum_protocol_coinbaser_save_good(T_DATUM_STRATUM_JOB *s, int n) {
 	datum_last_good_cb_count = n;
 	memcpy(datum_last_good_prevhash, s->prevhash_bin, 32);
 	datum_last_good_cb_value = s->coinbase_value;
+	datum_last_good_cb_id = s->datum_coinbaser_id;
+	datum_last_good_session = atomic_load(&datum_session_generation);
+	datum_last_good_prime_id = datum_config.prime_id;
+	snprintf(datum_last_good_pool_pubkey, sizeof(datum_last_good_pool_pubkey), "%s", datum_config.datum_pool_pubkey);
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
 }
 
@@ -1448,9 +1491,51 @@ void datum_protocol_coinbaser_reuse_reset(void) {
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
 	datum_last_good_cb_count = 0;
 	datum_last_good_cb_value = 0;
+	datum_last_good_cb_id = 0;
+	datum_last_good_session = 0;
+	datum_last_good_prime_id = 0;
+	datum_last_good_pool_pubkey[0] = 0;
 	memset(datum_last_good_prevhash, 0, sizeof(datum_last_good_prevhash));
 	memset(datum_last_good_cb_outs, 0, sizeof(datum_last_good_cb_outs));
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+}
+
+/* Records the request just sent. Called with the fetch mutex held. */
+void datum_protocol_coinbaser_note_request(uint64_t value, const unsigned char *prevhash, uint64_t session) {
+	datum_last_req_value = value;
+	memcpy(datum_last_req_prevhash, prevhash, 32);
+	datum_last_req_session = session;
+	datum_last_req_unanswered = true;
+}
+
+/* Called from the coinbaser thread between fetches. If the pool answered the
+ * last request after the fetch stopped waiting, save that answer as the last
+ * good split for the request's tip and value, and return its output count
+ * (copying the tip to prevhash_out). The caller refreshes the job so miners
+ * move onto the pool's own split. Returns 0 when there is nothing to apply. */
+int datum_protocol_coinbaser_take_late(unsigned char *prevhash_out) {
+	static T_DATUM_STRATUM_JOB scratch;
+	int n = 0;
+	if (pthread_mutex_trylock(&datum_protocol_coinbaser_fetch_mutex) != 0) return 0;
+	if (datum_last_req_unanswered && datum_coinbaser_v2_response &&
+	    datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] == datum_last_req_value &&
+	    datum_last_req_session == atomic_load(&datum_session_generation)) {
+		memset(&scratch, 0, sizeof(scratch));
+		scratch.coinbase_value = datum_last_req_value;
+		memcpy(scratch.prevhash_bin, datum_last_req_prevhash, 32);
+		n = datum_coinbaser_v2_parse(&scratch, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx]);
+		datum_coinbaser_v2_response = NULL;
+		datum_last_req_unanswered = false;
+		if (n >= 2) {
+			datum_protocol_coinbaser_save_good(&scratch, n);
+			if (prevhash_out) memcpy(prevhash_out, datum_last_req_prevhash, 32);
+			DLOG_INFO("Coinbaser: late answer applied (%d outs, value %" PRIu64 ")", n, datum_last_req_value);
+		} else {
+			n = 0;
+		}
+	}
+	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+	return n;
 }
 
 int datum_protocol_coinbaser_fetch(void *sptr) {
@@ -1490,6 +1575,15 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	 * answer, publish a stretched copy of the last multi-out list. Off: wait
 	 * the stock 5s and return whatever the pool sent, including a short list. */
 	const bool reuse_on = datum_config.datum_coinbaser_reuse;
+	if (reuse_on) {
+		/* A late answer for exactly this tip and value may already be saved;
+		 * it is the pool's own split, so no new request is needed. */
+		const int exact = datum_protocol_coinbaser_try_exact(s);
+		if (exact >= 2) {
+			DLOG_INFO("Coinbaser: pool's split for this tip and value already held (%d outs, id %u)", exact, (unsigned)s->datum_coinbaser_id);
+			return exact;
+		}
+	}
 	struct timespec ts_fast;
 	struct timespec ts_full;
 	bool in_fast_wait = reuse_on;
@@ -1521,10 +1615,12 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 		return 0;
 	}
+	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
 
 	for (;;) {
 		if (datum_coinbaser_v2_response &&
 		    datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] == value) {
+			datum_last_req_unanswered = false;
 			break;
 		}
 		rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);

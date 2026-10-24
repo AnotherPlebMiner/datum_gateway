@@ -54,6 +54,7 @@
 #include "datum_jsonrpc.h"
 #include "datum_protocol.h"
 #include "datum_coinbaser.h"
+#include "datum_blocktemplates.h"
 
 CURL *coinbaser_curl = NULL;
 
@@ -411,7 +412,21 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	int cb2idx[1] = { 0 };
 	int target_pot_index;
 	
-	if (datum_protocol_is_active()) {
+	/* Solo until first split: with coinbaser_reuse on and pooled_mining_only
+	 * off (the operator already accepts solo when the pool is down), a pooled
+	 * job is only built once a split from this pool is held. Before that, on
+	 * first connection or after switching pool, the job pays
+	 * mining.pool_address instead of the pool's script alone. The coinbaser
+	 * thread still asks the pool, and replaces this work once it answers. */
+	const bool solo_until_first_split = datum_protocol_is_active() &&
+		datum_config.datum_coinbaser_reuse &&
+		!datum_config.datum_pooled_mining_only &&
+		datum_config.mining_pool_address[0] &&
+		!datum_protocol_coinbaser_have_saved();
+	if (solo_until_first_split) {
+		DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
+	}
+	if (datum_protocol_is_active() && !solo_until_first_split) {
 		// DATUM
 		s->pool_addr_script_len = datum_config.override_mining_pool_scriptpubkey_len;
 		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptpubkey, datum_config.override_mining_pool_scriptpubkey_len);
@@ -921,6 +936,18 @@ void *datum_coinbaser_thread(void *ptr) {
 					need_coinbaser = false;
 				}
 				DLOG_DEBUG("Generated and notified.");
+				if (datum_config.datum_coinbaser_reuse && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
+					// solo until first split: the first split is saved, so move miners onto pooled work
+					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
+					datum_blocktemplates_notify_refresh();
+				}
+			}
+		}
+		
+		if (datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+			unsigned char late_tip[32];
+			if (datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
+				datum_blocktemplates_notify_refresh();
 			}
 		}
 		

@@ -198,7 +198,7 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "pooled_mining_only",			.description = "If the DATUM pool server becomes unavailable, terminate miner connections (otherwise, 100% of any blocks you find pay mining.pool_address)",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.datum_pooled_mining_only, 	.default_bool = true },
-	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "Use the last multi-out list for the opening job, and stretch that list onto the fee template until the pool's own split arrives. Default off: those jobs stay one pool output.",
+	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "When the pool has not answered a coinbaser request within 500ms, use its last split stretched to the job value instead of a coinbase paying only the pool; apply the pool's answer as soon as it arrives, even late. With pooled_mining_only false, work before the first split from a pool pays mining.pool_address instead of only the pool.",
 		.example_default = false,
 		.required = false, .ptr = &datum_config.datum_coinbaser_reuse, 	.default_bool = false },
 	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "protocol_global_timeout",		.description = "If no valid messages are received from the DATUM server in this many seconds, give up and try to reconnect",

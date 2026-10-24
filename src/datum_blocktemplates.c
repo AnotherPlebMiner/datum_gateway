@@ -85,6 +85,14 @@ void datum_blocktemplates_notify_othercause() {
 	notify_othercause = 1;
 }
 
+/* Ask for a standard job on the current tip now, served at once rather than
+ * paced: used when the pool's split arrives after miners were given a
+ * provisional one, or after the first split ends solo-until-first-split. */
+static atomic_int notify_refresh = 0;
+void datum_blocktemplates_notify_refresh(void) {
+	atomic_store(&notify_refresh, 1);
+}
+
 bool datum_blocktemplates_abw_ready(T_DATUM_TEMPLATE_DATA *block_template,
 	bool datum_active, bool abw_required) {
 	if (!block_template) return false;
@@ -605,7 +613,8 @@ void *datum_gateway_template_thread(void *args) {
 						} else {
 							i = datum_stratum_v1_global_subscriber_count();
 							DLOG_INFO("Updating standard stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
-							update_stratum_job(t,false,JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
+							const bool refresh = atomic_exchange(&notify_refresh, 0) != 0;
+							update_stratum_job(t,false,refresh ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
 						}
 					}
 				}
@@ -617,6 +626,9 @@ void *datum_gateway_template_thread(void *args) {
 		if ((!was_notified) || (new_notify || new_notify_threadsafe)) {
 			for(i=0;i<(((uint64_t)datum_config.bitcoind_work_update_seconds*(uint64_t)1000000)/(uint64_t)2500);i++) {
 				usleep(2500);
+				if (atomic_load(&notify_refresh) && !(new_notify || new_notify_threadsafe)) {
+					break;
+				}
 				if (new_notify || new_notify_threadsafe) {
 					new_notify = 0;
 					new_notify_threadsafe = 0;

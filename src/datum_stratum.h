@@ -178,6 +178,8 @@ typedef struct T_DATUM_STRATUM_JOB {
 	bool need_coinbaser;
 	
 	bool is_datum_job;
+	
+	bool provisional_split; // coinbases built at creation from the last split (coinbaser_reuse)
 	unsigned char datum_job_idx;
 	unsigned char datum_coinbaser_id;
 } T_DATUM_STRATUM_JOB;

@@ -1432,23 +1432,23 @@ unsigned int datum_stratum_coinbase_index(
 	const T_DATUM_STRATUM_THREADPOOL_DATA *sdata,
 	const T_DATUM_MINER_DATA *miner, bool new_block) {
 	const T_DATUM_STRATUM_JOB *job = (sdata && sdata->cur_stratum_job) ? sdata->cur_stratum_job : NULL;
-	/* Slot 5 is the saved base list at the subsidy. Slot 4 is that list
-	 * stretched to the fee total. Both are filled only when reuse is on. */
-	const bool reused = datum_config.datum_coinbaser_reuse && job &&
-		job->available_coinbase_outputs_count >= 2 &&
-		job->coinbase[4].coinb1_len > 0 &&
-		job->coinbase[5].coinb1_len > 0;
+	/* A provisional split (coinbaser_reuse) is built into every size class
+	 * at creation, so the opening job of a new block serves the miner's own
+	 * class with the full template rather than the pool-only empty job. */
 	if (new_block) {
-		if (reused) return 5;
+		if (job && job->provisional_split && miner && miner->coinbase_selection < MAX_COINBASE_TYPES) {
+			return miner->coinbase_selection;
+		}
 		return DATUM_COINBASE_ID_EMPTY;
+	}
+	if (job && job->provisional_split && miner && miner->coinbase_selection < MAX_COINBASE_TYPES) {
+		// every class carries the provisional split; class 0 alone would pay only the pool
+		return miner->coinbase_selection;
 	}
 	if (!sdata || !miner || !job ||
 	    job->job_state < JOB_STATE_FULL_PRIORITY_WAIT_COINBASER ||
 	    !sdata->full_coinbase_ready ||
-	    miner->coinbase_selection >= MAX_COINBASE_TYPES) {
-		if (reused) return 4;
-		return 0;
-	}
+	    miner->coinbase_selection >= MAX_COINBASE_TYPES) return 0;
 	return miner->coinbase_selection;
 }
 
@@ -2053,24 +2053,17 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	// prep the coinbase txn(s) for this job
 	generate_base_coinbase_txns_for_stratum_job(s, s->is_new_block);
 
-	/* datum.coinbaser_reuse is off by default. When on, and a base list has
-	 * been saved: the opening notify (slot 5) uses that list at the subsidy,
-	 * and the fee template (slot 4) uses it stretched to this job's total.
-	 * The pool's own answer still replaces the stretched copy on the later
-	 * job. No saved list leaves the one-output coinbase in place. */
-	if (datum_config.datum_coinbaser_reuse && s->is_new_block) {
-		const uint64_t fee_value = s->coinbase_value;
-		bool have_base = false;
-		s->coinbase_value = block_reward(s->height);
+	/* datum.coinbaser_reuse is off by default. When on, and a split from
+	 * this pool is held, the opening job of a new block builds every size
+	 * class from that split stretched to this template's full value, and
+	 * miners get the full template with it instead of the pool-only empty
+	 * job. The coinbase classes carry the template's witness commitment, so
+	 * they are never paired with the empty (subsidy-only) work. The pool's
+	 * own answer replaces this on the job that follows. */
+	if (datum_config.datum_coinbaser_reuse && s->is_new_block && s->is_datum_job) {
 		if (datum_protocol_coinbaser_try_reuse(s) >= 2) {
 			generate_coinbase_txns_for_stratum_job(s, false);
-			s->subsidy_only_coinbase = s->coinbase[4];
-			have_base = true;
-		}
-		s->coinbase_value = fee_value;
-		if (have_base && datum_protocol_coinbaser_try_reuse(s) >= 2) {
-			generate_coinbase_txns_for_stratum_job(s, false);
-			s->coinbase[5] = s->subsidy_only_coinbase;
+			s->provisional_split = true;
 		}
 	}
 	

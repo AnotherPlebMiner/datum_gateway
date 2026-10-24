@@ -148,6 +148,8 @@ bool datum_protocol_abw_required(void);
 void datum_increment_session_nonce(void *s);
 int datum_protocol_fetch_coinbaser(uint64_t value);
 int datum_protocol_coinbaser_fetch(void *s);
+bool datum_protocol_coinbaser_have_saved(void);
+int datum_protocol_coinbaser_take_late(unsigned char *prevhash_out);
 int datum_protocol_migration_request(int len, const unsigned char *data);
 bool datum_protocol_take_connect_endpoint(
 	char *host,
