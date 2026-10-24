@@ -198,7 +198,7 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "pooled_mining_only",			.description = "If the DATUM pool server becomes unavailable, terminate miner connections (otherwise, 100% of any blocks you find pay mining.pool_address)",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.datum_pooled_mining_only, 	.default_bool = true },
-	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "When the pool has not answered a coinbaser request within 500ms, use its last split stretched to the job value instead of a coinbase paying only the pool; apply the pool's answer as soon as it arrives, even late. With pooled_mining_only false, work before the first split from a pool pays mining.pool_address instead of only the pool.",
+	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "When the pool has not answered a coinbaser request within 500ms, use its last split stretched to the job value instead of a coinbase paying only the pool, and apply the pool's answer when it arrives, even late. The split is not reused when the previous block's coinbase pays 2 or more of its outputs (needs the getblock RPC). With pooled_mining_only false, work pays mining.pool_address before a pool's first split, and after such a block until the pool answers.",
 		.example_default = false,
 		.required = false, .ptr = &datum_config.datum_coinbaser_reuse, 	.default_bool = false },
 	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "protocol_global_timeout",		.description = "If no valid messages are received from the DATUM server in this many seconds, give up and try to reconnect",

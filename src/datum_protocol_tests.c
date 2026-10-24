@@ -38,8 +38,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
+#include "datum_coinbaser.h"
 #include "datum_conf.h"
 #include "datum_pow.h"
 #include "datum_protocol_internal.h"
@@ -1803,6 +1806,443 @@ static void datum_protocol_job_validation_bounds_test(void) {
 	free(req);
 }
 
+/* A block whose coinbase pays the given 22-byte P2WPKH scripts (fill bytes),
+ * plus a witness commitment and a script too long to be a split output. */
+static size_t datum_prev_test_block(char *hex, size_t cap, const unsigned char *fills, int nfill, bool segwit, bool blake2b) {
+	unsigned char b[1024];
+	size_t k = 0, i;
+	int o;
+	k = blake2b ? DATUM_BLAKE2B_BLOCK_HEADER_SIZE : 80;
+	memset(b, 0x11, k); // header
+	b[3] = blake2b ? 0xa0 : 0x20;
+	b[k++] = 2; // txs (only the coinbase is read)
+	pk_u32le(b, k, 2); k += 4;
+	if (segwit) { b[k++] = 0; b[k++] = 1; }
+	b[k++] = 1;
+	memset(&b[k], 0, 32); k += 32;
+	pk_u32le(b, k, 0xffffffff); k += 4;
+	b[k++] = 3; b[k++] = 0x03; b[k++] = 0x10; b[k++] = 0x27;
+	pk_u32le(b, k, 0xffffffff); k += 4;
+	b[k++] = (unsigned char)(nfill + 2);
+	for (o = 0; o < nfill; o++) {
+		pk_u64le(b, k, 100000000); k += 8;
+		b[k++] = 22; b[k++] = 0x00; b[k++] = 0x14;
+		memset(&b[k], fills[o], 20); k += 20;
+	}
+	pk_u64le(b, k, 0); k += 8;
+	b[k++] = 38; b[k++] = 0x6a; b[k++] = 0x24; b[k++] = 0xaa; b[k++] = 0x21; b[k++] = 0xa9; b[k++] = 0xed;
+	memset(&b[k], 0x5c, 32); k += 32;
+	pk_u64le(b, k, 0); k += 8;
+	b[k++] = 0xfd; b[k++] = 70; b[k++] = 0; b[k++] = 0x6a; b[k++] = 0x44; // 70-byte script, 3-byte varint
+	memset(&b[k], 0x77, 68); k += 68;
+	if (segwit) { b[k++] = 1; b[k++] = 32; memset(&b[k], 0, 32); k += 32; }
+	memset(&b[k], 0, 4); k += 4;
+	memset(&b[k], 0x99, 20); k += 20; // stands in for the second transaction
+	if (k * 2 + 1 > cap) return 0;
+	for (i = 0; i < k; i++) uchar_to_hex(&hex[i * 2], b[i]);
+	hex[k * 2] = 0;
+	return k * 2;
+}
+
+static void datum_prev_test_save(T_DATUM_STRATUM_JOB *job, const unsigned char *tip, const unsigned char *fills, int n) {
+	int o;
+	memset(job, 0, sizeof(*job));
+	memcpy(job->prevhash_bin, tip, 32);
+	job->coinbase_value = 300000000;
+	job->datum_coinbaser_id = 5;
+	for (o = 0; o < n; o++) {
+		job->available_coinbase_outputs[o].value_sats = 100000000;
+		job->available_coinbase_outputs[o].output_script_len = 22;
+		job->available_coinbase_outputs[o].output_script[0] = 0x00;
+		job->available_coinbase_outputs[o].output_script[1] = 0x14;
+		memset(&job->available_coinbase_outputs[o].output_script[2], fills[o], 20);
+	}
+	job->available_coinbase_outputs_count = n;
+	datum_protocol_coinbaser_save_good(job, n);
+}
+
+typedef struct {
+	int listen_fd;
+	const char *block_hex;
+	int delay_ms;
+	char expected_hash[65];
+	bool saw_getblock;
+	pthread_t thread;
+} T_DATUM_PREV_TEST_SERVER;
+
+static void *datum_prev_test_server(void *arg) {
+	T_DATUM_PREV_TEST_SERVER *server = arg;
+	char request[4096] = {0};
+	char response[4096];
+	size_t used = 0;
+	int len;
+	const int client = accept(server->listen_fd, NULL, NULL);
+	if (client < 0) return NULL;
+	while (used + 1 < sizeof(request)) {
+		unsigned long body_size = 0;
+		const ssize_t n = recv(client, request + used, sizeof(request) - used - 1, 0);
+		if (n <= 0) break;
+		used += (size_t)n;
+		request[used] = 0;
+		char *body = strstr(request, "\r\n\r\n");
+		char *length = strstr(request, "Content-Length:");
+		if (body && length && sscanf(length, "Content-Length: %lu", &body_size) == 1 &&
+		    used >= (size_t)(body + 4 - request) + body_size) break;
+	}
+	server->saw_getblock = strstr(request, "\"method\":\"getblock\"") &&
+		strstr(request, server->expected_hash) && strstr(request, ",0]");
+	if (server->delay_ms) usleep((useconds_t)server->delay_ms * 1000);
+	char body[3072];
+	snprintf(body, sizeof(body), "{\"result\":\"%s\",\"error\":null,\"id\":\"datum-prev-check\"}", server->block_hex);
+	len = snprintf(response, sizeof(response),
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+		strlen(body), body);
+	if (len > 0 && (size_t)len < sizeof(response)) {
+		const char *p = response;
+		size_t left = (size_t)len;
+		while (left) {
+			const ssize_t n = send(client, p, left, MSG_NOSIGNAL);
+			if (n <= 0) break;
+			p += n;
+			left -= (size_t)n;
+		}
+	}
+	close(client);
+	return NULL;
+}
+
+/* Starts a fake bitcoind that serves block_hex for one getblock of tip. */
+static bool datum_prev_test_serve(T_DATUM_PREV_TEST_SERVER *server, const unsigned char *tip, const char *block_hex, int delay_ms) {
+	const struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+	struct sockaddr_in bound;
+	socklen_t bound_len = sizeof(bound);
+	int i;
+	memset(server, 0, sizeof(*server));
+	server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	server->block_hex = block_hex;
+	server->delay_ms = delay_ms;
+	datum_test(server->listen_fd >= 0);
+	if (server->listen_fd < 0) return false;
+	datum_test(!bind(server->listen_fd, (const struct sockaddr *)&address, sizeof(address)));
+	datum_test(!listen(server->listen_fd, 1));
+	datum_test(!getsockname(server->listen_fd, (struct sockaddr *)&bound, &bound_len));
+	for (i = 0; i < 32; i++) uchar_to_hex(&server->expected_hash[i * 2], tip[31 - i]);
+	server->expected_hash[64] = 0;
+	snprintf(datum_config.bitcoind_rpcurl, sizeof(datum_config.bitcoind_rpcurl), "http://127.0.0.1:%u", ntohs(bound.sin_port));
+	strcpy(datum_config.bitcoind_rpcuserpass, "test:test");
+	datum_test(!pthread_create(&server->thread, NULL, datum_prev_test_server, server));
+	return true;
+}
+
+static void datum_prev_test_unserve(T_DATUM_PREV_TEST_SERVER *server) {
+	pthread_join(server->thread, NULL);
+	close(server->listen_fd);
+}
+
+/* Runs the check against a fake bitcoind serving block_hex for tip. */
+static bool datum_prev_test_check(const T_DATUM_STRATUM_JOB *job, const char *block_hex, bool *saw_getblock) {
+	T_DATUM_PREV_TEST_SERVER server;
+	bool r;
+	*saw_getblock = false;
+	if (!datum_prev_test_serve(&server, job->prevhash_bin, block_hex, 0)) return false;
+	r = datum_protocol_coinbaser_check_prev_block(job->prevhash_bin);
+	datum_prev_test_unserve(&server);
+	*saw_getblock = server.saw_getblock;
+	return r;
+}
+
+/* A coinbaser answer (0x11 payload) paying the given fills, 22-byte scripts. */
+static unsigned char datum_prev_test_resp[12 + 1 + 3 * (8 + 1 + 22)];
+static int datum_prev_test_resp_len;
+static void datum_prev_test_answer(uint64_t value, const unsigned char *fills, int n) {
+	size_t k = 0;
+	int o;
+	pk_u64le(datum_prev_test_resp, k, value); k += 8;
+	pk_u32le(datum_prev_test_resp, k, (uint32_t)(1 + n * (8 + 1 + 22))); k += 4;
+	datum_prev_test_resp[k++] = 4; // coinbaser id
+	for (o = 0; o < n; o++) {
+		pk_u64le(datum_prev_test_resp, k, value / (uint64_t)n); k += 8;
+		datum_prev_test_resp[k++] = 22;
+		datum_prev_test_resp[k] = 0x00; datum_prev_test_resp[k + 1] = 0x14;
+		memset(&datum_prev_test_resp[k + 2], fills[o], 20);
+		k += 22;
+	}
+	datum_prev_test_resp_len = (int)k;
+}
+
+static void *datum_prev_test_answer_later(void *arg) {
+	(void)arg;
+	usleep(50000);
+	datum_test(datum_protocol_coinbaser_fetch_response(datum_prev_test_resp_len, datum_prev_test_resp) == 1);
+	return NULL;
+}
+
+/* Runs the real fetch for job; an answer is posted after 50ms when answer is true. */
+static int datum_prev_test_fetch(T_DATUM_STRATUM_JOB *job, bool answer, uint64_t *elapsed_ms) {
+	pthread_t responder;
+	uint64_t start;
+	int r;
+	if (answer) datum_test(!pthread_create(&responder, NULL, datum_prev_test_answer_later, NULL));
+	start = current_time_millis();
+	r = datum_protocol_coinbaser_fetch(job);
+	*elapsed_ms = current_time_millis() - start;
+	if (answer) pthread_join(responder, NULL);
+	return r;
+}
+
+static void datum_coinbaser_prev_block_fetch_tests(void) {
+	const global_config_t saved_config = datum_config;
+	const int saved_active = atomic_load(&datum_protocol_client_active);
+	const int saved_out = server_out_buf;
+	const uint32_t saved_header_key = sending_header_key;
+	unsigned char saved_nonce[crypto_box_NONCEBYTES];
+	const unsigned char split[3] = { 0x30, 0x31, 0x32 };
+	const unsigned char paid_two[2] = { 0x31, 0x30 };
+	const unsigned char fresh[2] = { 0x50, 0x51 };
+	unsigned char tip_a[32], tip_b[32], tip_c[32], tip_d[32], tip_e[32], got[32];
+	static T_DATUM_STRATUM_JOB job;
+	static char pool_hex[2048];
+	T_DATUM_PREV_TEST_SERVER server;
+	uint64_t ms = 0;
+	int r;
+
+	memcpy(saved_nonce, session_nonce_sender, sizeof(saved_nonce));
+	memset(tip_a, 0xa4, 32);
+	memset(tip_b, 0xb5, 32);
+	memset(tip_c, 0xc6, 32);
+	memset(tip_d, 0xd7, 32);
+	memset(tip_e, 0xe8, 32);
+	datum_test(datum_prev_test_block(pool_hex, sizeof(pool_hex), paid_two, 2, true, true) > 0);
+	atomic_store(&datum_protocol_client_active, 3);
+	datum_config.datum_coinbaser_reuse = true;
+	datum_config.datum_pooled_mining_only = true;
+
+	// The pool found the previous block and is silent: no stale stretch, and
+	// the fetch returns at the fast-wait miss rather than after 5s.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 310000000;
+	datum_prev_test_serve(&server, tip_b, pool_hex, 0);
+	r = datum_prev_test_fetch(&job, false, &ms);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(r == 0);
+	datum_test(ms >= 400 && ms < 2500);
+	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
+	// Its late answer is applied, ending solo and the skip.
+	datum_prev_test_answer(310000000, fresh, 2);
+	datum_test(datum_protocol_coinbaser_fetch_response(datum_prev_test_resp_len, datum_prev_test_resp) == 1);
+	datum_test(datum_protocol_coinbaser_take_late(got) == 2);
+	datum_test(memcmp(got, tip_b, 32) == 0);
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+
+	// An answer during a slow getblock is not held up by it.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	job.coinbase_value = 310000000;
+	datum_prev_test_answer(310000000, fresh, 2);
+	datum_prev_test_serve(&server, tip_c, pool_hex, 400);
+	r = datum_prev_test_fetch(&job, true, &ms);
+	datum_test(r == 2);
+	datum_test(ms < 350);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	// The pool's own split for the tip is held, so the check's verdict is moot.
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+
+	// A short answer that beats the check: the stale split is still not
+	// stretched, and the answer ends solo for the tip.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_d, 32);
+	job.coinbase_value = 310000000;
+	datum_prev_test_answer(310000000, fresh, 1);
+	datum_prev_test_serve(&server, tip_d, pool_hex, 300);
+	r = datum_prev_test_fetch(&job, true, &ms);
+	datum_prev_test_unserve(&server);
+	datum_test(r < 2);
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_d));
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_d, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+
+	// A getblock slower than the fast wait does not hold the fetch: the
+	// verdict is unknown at the miss, and applies once the check ends.
+	datum_prev_check_wait(NULL);
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_e, 32);
+	job.coinbase_value = 310000000;
+	datum_prev_test_serve(&server, tip_e, pool_hex, 1500);
+	r = datum_prev_test_fetch(&job, false, &ms);
+	datum_test(r == 3);
+	datum_test(ms >= 400 && ms < 1200);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_e));
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_e, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+
+	datum_prev_check_wait(NULL);
+	datum_protocol_coinbaser_reuse_reset();
+	atomic_store(&datum_protocol_client_active, saved_active);
+	server_out_buf = saved_out;
+	sending_header_key = saved_header_key;
+	memcpy(session_nonce_sender, saved_nonce, sizeof(saved_nonce));
+	datum_config = saved_config;
+}
+
+/* Builds the base coinbase for a job on tip; returns whether it pays the pool. */
+static bool datum_prev_test_base_is_datum(const unsigned char *tip) {
+	static T_DATUM_TEMPLATE_DATA tdata;
+	static T_DATUM_STRATUM_JOB base;
+	memset(&tdata, 0, sizeof(tdata));
+	memset(&base, 0, sizeof(base));
+	tdata.sizelimit = 4000000;
+	tdata.weightlimit = 4000000;
+	tdata.sigoplimit = 80000;
+	strcpy(tdata.default_witness_commitment, "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000");
+	base.block_template = &tdata;
+	base.coinbase_value = 310000000;
+	base.height = 42;
+	memcpy(base.prevhash_bin, tip, 32);
+	generate_base_coinbase_txns_for_stratum_job(&base, false);
+	return base.is_datum_job;
+}
+
+static void datum_coinbaser_prev_block_tests(void) {
+	const global_config_t saved_config = datum_config;
+	const unsigned char split[3] = { 0x30, 0x31, 0x32 };
+	const unsigned char paid_two[2] = { 0x31, 0x30 };
+	const unsigned char paid_one[2] = { 0x30, 0x40 };
+	unsigned char tip_a[32], tip_b[32], tip_c[32];
+	static T_DATUM_STRATUM_JOB job;
+	char hex[2048];
+	bool saw = false;
+	size_t len;
+
+	memset(tip_a, 0xa1, 32);
+	memset(tip_b, 0xb2, 32);
+	memset(tip_c, 0xc3, 32);
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+
+	// Parser: only the coinbase outputs count, with and without witness serialization.
+	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, true);
+	datum_test(len > 0);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 2, job.available_coinbase_outputs, 3) == 2);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 1, job.available_coinbase_outputs, 3) == -1);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, 400, job.available_coinbase_outputs, 3) == -1);
+	hex[2 * 230] = 'z'; // inside the first output script
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == -1);
+	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, false, true);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
+	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, false);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
+	hex[6] = 'a'; // an 80-byte header read as blake2b
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) != 2);
+	len = datum_prev_test_block(hex, sizeof(hex), paid_one, 2, true, true);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 1);
+	datum_test(datum_protocol_coinbaser_prev_block_matches("", 0, job.available_coinbase_outputs, 3) == -1);
+
+	// No new tip: the saved split is for this tip, so bitcoind is not asked.
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_a, 32);
+	datum_test(!datum_protocol_coinbaser_check_prev_block(job.prevhash_bin));
+
+	// The pool's block on tip_b: the split is not stretched onto tip_b.
+	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, true);
+	memcpy(job.prevhash_bin, tip_b, 32);
+	datum_test(datum_prev_test_check(&job, hex, &saw));
+	datum_test(saw);
+	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	{
+		// Work on tip_b pays mining.pool_address unless pooled_mining_only is set.
+		const int saved_active = atomic_load(&datum_protocol_client_active);
+		unsigned char notice[36] = { DATUM_ABW_DRAFT_REVISION, DATUM_ABW_ASSIGNMENT_ACTIVE, 0 };
+		memset(notice + 3, 0x5a, 32);
+		notice[35] = 0xFE;
+		atomic_store(&datum_protocol_client_active, 3);
+		datum_test(datum_protocol_abw_assignment_notice(sizeof(notice), notice));
+		datum_test(datum_protocol_is_active());
+		datum_config.datum_coinbaser_reuse = true;
+		datum_config.datum_pooled_mining_only = false;
+		strcpy(datum_config.mining_pool_address, "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
+		datum_config.override_mining_pool_scriptpubkey[0] = 0x51;
+		datum_config.override_mining_pool_scriptpubkey_len = 1;
+		datum_test(!datum_prev_test_base_is_datum(tip_b));
+		datum_test(datum_prev_test_base_is_datum(tip_c));
+		datum_config.datum_pooled_mining_only = true;
+		datum_test(datum_prev_test_base_is_datum(tip_b));
+		datum_config.datum_pooled_mining_only = false;
+		datum_protocol_abw_reset();
+		atomic_store(&datum_protocol_client_active, saved_active);
+	}
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_test(job.available_coinbase_outputs_count == 0);
+	// Checked once per tip: no second request.
+	datum_test(!datum_protocol_coinbaser_check_prev_block(job.prevhash_bin));
+	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
+	// Another tip still reuses the split.
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+
+	// The pool's answer for tip_b ends the skip and is reused exactly.
+	datum_prev_test_save(&job, tip_b, split, 3);
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 300000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+	datum_test(job.datum_coinbaser_id == 5);
+
+	// A block paying only one split script is not the pool's.
+	len = datum_prev_test_block(hex, sizeof(hex), paid_one, 2, true, true);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	datum_test(!datum_prev_test_check(&job, hex, &saw));
+	datum_test(saw);
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+
+	// An unreadable block is not the pool's.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_b, 32);
+	datum_test(!datum_prev_test_check(&job, "00zz", &saw));
+	datum_test(saw);
+	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+
+	datum_protocol_coinbaser_reuse_reset();
+	datum_config = saved_config;
+}
+
 void datum_protocol_tests(void) {
 	datum_protocol_hello_framing_offer_tests();
 	datum_protocol_receive_mode_tests();
@@ -1813,6 +2253,8 @@ void datum_protocol_tests(void) {
 	datum_protocol_config_v3_tests();
 	datum_coinbaser_reuse_same_tip_tests();
 	datum_coinbaser_reuse_pool_and_late_tests();
+	datum_coinbaser_prev_block_tests();
+	datum_coinbaser_prev_block_fetch_tests();
 	datum_protocol_migration_tests();
 	datum_protocol_bulk_tests();
 	datum_protocol_resume_tests();

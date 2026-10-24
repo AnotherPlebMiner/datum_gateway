@@ -47,6 +47,7 @@
 // TODO: Implement resuiming of work without allowing one client to cause duplicate work for another
 
 #include <sodium.h>
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -71,6 +72,7 @@
 #include "datum_protocol.h"
 #include "datum_protocol_internal.h"
 #include "datum_conf.h"
+#include "datum_jsonrpc.h"
 #include "datum_sockets.h"
 #include "datum_stratum.h"
 #include "datum_blocktemplates.h"
@@ -1392,6 +1394,50 @@ static bool datum_last_req_unanswered = false;
 
 #define DATUM_COINBASER_FAST_WAIT_NS 500000000L /* 500ms */
 
+/* Previous-block check: on a new tip, the coinbase of the block just found
+ * is read from bitcoind. If it pays 2 or more of the saved split's scripts,
+ * the pool found that block and its payouts have moved on, so the saved split
+ * is not stretched onto this tip until the pool sends a new one, and work on
+ * the tip is solo (when allowed) until the pool answers for it at all.
+ * Guarded by datum_last_good_cb_mutex. */
+static unsigned char datum_prev_checked_tip[32];
+static bool datum_prev_checked = false;
+static bool datum_prev_pool_block = false;
+static unsigned char datum_prev_answered_tip[32];
+static bool datum_prev_answered = false;
+
+static bool datum_prev_pool_block_locked(const unsigned char *tip) {
+	return datum_prev_checked && datum_prev_pool_block && memcmp(datum_prev_checked_tip, tip, 32) == 0;
+}
+
+/* True while the saved split is stale for this tip. */
+static bool datum_protocol_coinbaser_prev_stale(const unsigned char *tip) {
+	bool r;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	r = datum_prev_pool_block_locked(tip);
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	return r;
+}
+
+/* True while work on this tip should be solo: the pool found the previous
+ * block and has not answered for this tip yet. */
+bool datum_protocol_coinbaser_prev_pool_block(const unsigned char *tip) {
+	bool r;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	r = datum_prev_pool_block_locked(tip) &&
+		!(datum_prev_answered && memcmp(datum_prev_answered_tip, tip, 32) == 0);
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	return r;
+}
+
+/* The pool answered for this tip, even if with a short list. */
+static void datum_protocol_coinbaser_note_answer(const unsigned char *tip) {
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	memcpy(datum_prev_answered_tip, tip, 32);
+	datum_prev_answered = true;
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+}
+
 static bool datum_last_good_matches_pool_locked(void) {
 	return datum_last_good_cb_count >= 2 && datum_last_good_prime_id == datum_config.prime_id &&
 		strcmp(datum_last_good_pool_pubkey, datum_config.datum_pool_pubkey) == 0;
@@ -1439,6 +1485,12 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 		return n;
 	}
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	if (datum_prev_pool_block_locked(s->prevhash_bin)) {
+		pthread_mutex_unlock(&datum_last_good_cb_mutex);
+		DLOG_INFO("Coinbaser: the pool found the previous block; not reusing its split");
+		s->available_coinbase_outputs_count = 0;
+		return 0;
+	}
 	if (datum_last_good_matches_pool_locked()) {
 		memcpy(s->available_coinbase_outputs, datum_last_good_cb_outs,
 		       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
@@ -1484,7 +1536,216 @@ void datum_protocol_coinbaser_save_good(T_DATUM_STRATUM_JOB *s, int n) {
 	datum_last_good_session = atomic_load(&datum_session_generation);
 	datum_last_good_prime_id = datum_config.prime_id;
 	snprintf(datum_last_good_pool_pubkey, sizeof(datum_last_good_pool_pubkey), "%s", datum_config.datum_pool_pubkey);
+	if (memcmp(datum_prev_checked_tip, s->prevhash_bin, 32) == 0) {
+		datum_prev_pool_block = false;
+	}
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+}
+
+static bool datum_prev_hex_byte(const char *hex, size_t nbytes, size_t *pos, unsigned char *out) {
+	if (*pos >= nbytes || !isxdigit((unsigned char)hex[*pos * 2]) || !isxdigit((unsigned char)hex[*pos * 2 + 1])) return false;
+	*out = hex2bin_uchar(&hex[*pos * 2]);
+	(*pos)++;
+	return true;
+}
+
+static bool datum_prev_hex_skip(size_t nbytes, size_t *pos, uint64_t n) {
+	if (n > nbytes - *pos) return false;
+	*pos += (size_t)n;
+	return true;
+}
+
+static bool datum_prev_hex_varint(const char *hex, size_t nbytes, size_t *pos, uint64_t *out) {
+	unsigned char b;
+	int len, k;
+	if (!datum_prev_hex_byte(hex, nbytes, pos, &b)) return false;
+	if (b < 0xfd) {
+		*out = b;
+		return true;
+	}
+	len = (b == 0xfd) ? 2 : (b == 0xfe) ? 4 : 8;
+	*out = 0;
+	for (k = 0; k < len; k++) {
+		if (!datum_prev_hex_byte(hex, nbytes, pos, &b)) return false;
+		*out |= (uint64_t)b << (8 * k);
+	}
+	return true;
+}
+
+/* Counts the saved outputs paid by the first (coinbase) transaction of a
+ * hex-encoded block. Only the coinbase is read. -1 if it cannot be parsed.
+ * Version bit 31 marks the blake2b header; otherwise the header is 80 bytes. */
+int datum_protocol_coinbaser_prev_block_matches(const char *hex, size_t hex_len, const T_DATUM_TXN_OUTPUT *outs, int n) {
+	bool hit[512] = { false };
+	unsigned char script[64];
+	unsigned char b;
+	const size_t nbytes = hex_len / 2;
+	size_t pos = 0;
+	uint64_t count, vout, slen, o, k;
+	int matched = 0;
+	int i;
+	if (!hex || (hex_len & 1) || n < 0 || n > 512) return -1;
+	pos = 3;
+	if (!datum_prev_hex_byte(hex, nbytes, &pos, &b)) return -1;
+	pos = (b & 0x80) ? DATUM_BLAKE2B_BLOCK_HEADER_SIZE : 80;
+	if (pos > nbytes) return -1;
+	if (!datum_prev_hex_varint(hex, nbytes, &pos, &count) || count < 1) return -1;
+	if (!datum_prev_hex_skip(nbytes, &pos, 4)) return -1;
+	if (!datum_prev_hex_byte(hex, nbytes, &pos, &b)) return -1;
+	if (b == 0) {
+		// segwit marker; the flag must be 1
+		if (!datum_prev_hex_byte(hex, nbytes, &pos, &b) || b != 1) return -1;
+	} else {
+		pos--;
+	}
+	if (!datum_prev_hex_varint(hex, nbytes, &pos, &count) || count != 1) return -1;
+	if (!datum_prev_hex_skip(nbytes, &pos, 36)) return -1;
+	if (!datum_prev_hex_varint(hex, nbytes, &pos, &slen) || !datum_prev_hex_skip(nbytes, &pos, slen)) return -1;
+	if (!datum_prev_hex_skip(nbytes, &pos, 4)) return -1;
+	if (!datum_prev_hex_varint(hex, nbytes, &pos, &vout)) return -1;
+	for (o = 0; o < vout; o++) {
+		if (!datum_prev_hex_skip(nbytes, &pos, 8)) return -1;
+		if (!datum_prev_hex_varint(hex, nbytes, &pos, &slen)) return -1;
+		if (slen > sizeof(script)) {
+			if (!datum_prev_hex_skip(nbytes, &pos, slen)) return -1;
+			continue;
+		}
+		for (k = 0; k < slen; k++) {
+			if (!datum_prev_hex_byte(hex, nbytes, &pos, &script[k])) return -1;
+		}
+		for (i = 0; i < n; i++) {
+			if (!hit[i] && (uint64_t)outs[i].output_script_len == slen &&
+			    memcmp(outs[i].output_script, script, (size_t)slen) == 0) {
+				hit[i] = true;
+				matched++;
+				break;
+			}
+		}
+	}
+	return matched;
+}
+
+/* A check is due when a split from this pool is held for an older tip and
+ * this tip has not been checked. */
+static bool datum_prev_check_wanted_locked(const unsigned char *tip) {
+	return datum_last_good_matches_pool_locked() &&
+		memcmp(datum_last_good_prevhash, tip, 32) != 0 &&
+		!(datum_prev_checked && memcmp(datum_prev_checked_tip, tip, 32) == 0);
+}
+
+/* Runs once per new tip. Returns true when the check finds the pool's block. */
+bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
+	static T_DATUM_TXN_OUTPUT outs[512];
+	static CURL *curl = NULL;
+	char req[160];
+	char tip_hex[65];
+	json_t *r = NULL;
+	const char *hex;
+	uint64_t start;
+	int n = 0;
+	int matched = -1;
+	int i;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	if (datum_prev_check_wanted_locked(tip)) {
+		memcpy(outs, datum_last_good_cb_outs, sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
+		n = datum_last_good_cb_count;
+	}
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	if (n < 2) return false;
+
+	start = current_time_millis();
+	for (i = 0; i < 32; i++) {
+		uchar_to_hex(&tip_hex[i * 2], tip[31 - i]);
+	}
+	tip_hex[64] = 0;
+	snprintf(req, sizeof(req), "{\"jsonrpc\":\"1.0\",\"id\":\"datum-prev-check\",\"method\":\"getblock\",\"params\":[\"%s\",0]}", tip_hex);
+	if (!curl) curl = curl_easy_init();
+	if (curl) r = bitcoind_json_rpc_call(curl, &datum_config, req);
+	hex = r ? json_string_value(json_object_get(r, "result")) : NULL;
+	if (hex) matched = datum_protocol_coinbaser_prev_block_matches(hex, strlen(hex), outs, n);
+	if (r) json_decref(r);
+
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	memcpy(datum_prev_checked_tip, tip, 32);
+	datum_prev_checked = true;
+	// a split the pool sent for this tip while bitcoind was asked is not stale
+	datum_prev_pool_block = matched >= 2 && memcmp(datum_last_good_prevhash, tip, 32) != 0;
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+
+	if (matched < 0) {
+		DLOG_WARN("Coinbaser: prev-block check: could not read block %s in %" PRIu64 " ms", tip_hex, current_time_millis() - start);
+	} else {
+		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid)", (matched >= 2) ? "yes" : "no", current_time_millis() - start, matched, n);
+	}
+	return matched >= 2;
+}
+
+/* The check runs on its own thread, so it overlaps the fast wait instead of
+ * delaying an answer the pool already sent. Only the coinbaser thread starts,
+ * waits for and joins it, one at a time. The coinbaser waits for its verdict
+ * no longer than the fast wait; a slower check counts as unknown, like a
+ * failed one, and still moves work to solo through the refresh when it ends. */
+static pthread_t datum_prev_check_tid;
+static bool datum_prev_check_running = false;
+static unsigned char datum_prev_check_tip[32];
+static pthread_mutex_t datum_prev_check_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t datum_prev_check_cond = PTHREAD_COND_INITIALIZER;
+static bool datum_prev_check_done = false;
+
+static void *datum_prev_check_thread(void *arg) {
+	(void)arg;
+	if (datum_protocol_coinbaser_check_prev_block(datum_prev_check_tip) &&
+	    !datum_config.datum_pooled_mining_only && datum_config.mining_pool_address[0] &&
+	    datum_protocol_coinbaser_prev_pool_block(datum_prev_check_tip)) {
+		DLOG_INFO("Coinbaser: replacing the reused split with solo work until the pool answers");
+		datum_blocktemplates_notify_refresh();
+	}
+	pthread_mutex_lock(&datum_prev_check_mutex);
+	datum_prev_check_done = true;
+	pthread_cond_broadcast(&datum_prev_check_cond);
+	pthread_mutex_unlock(&datum_prev_check_mutex);
+	return NULL;
+}
+
+/* Waits for a running check until deadline (CLOCK_REALTIME), or without
+ * limit when deadline is NULL. True once no check is running. */
+bool datum_prev_check_wait(const struct timespec *deadline) {
+	bool done;
+	if (!datum_prev_check_running) return true;
+	pthread_mutex_lock(&datum_prev_check_mutex);
+	while (!datum_prev_check_done) {
+		if (!deadline) {
+			pthread_cond_wait(&datum_prev_check_cond, &datum_prev_check_mutex);
+		} else if (pthread_cond_timedwait(&datum_prev_check_cond, &datum_prev_check_mutex, deadline) == ETIMEDOUT) {
+			break;
+		}
+	}
+	done = datum_prev_check_done;
+	pthread_mutex_unlock(&datum_prev_check_mutex);
+	if (!done) return false;
+	pthread_join(datum_prev_check_tid, NULL);
+	datum_prev_check_running = false;
+	return true;
+}
+
+static void datum_prev_check_start(const unsigned char *tip) {
+	const struct timespec now = { 0, 0 };
+	bool wanted;
+	int rc;
+	// one at a time: a tip skipped here is checked on its next fetch
+	if (!datum_prev_check_wait(&now)) return;
+	pthread_mutex_lock(&datum_last_good_cb_mutex);
+	wanted = datum_prev_check_wanted_locked(tip);
+	pthread_mutex_unlock(&datum_last_good_cb_mutex);
+	if (!wanted) return;
+	memcpy(datum_prev_check_tip, tip, 32);
+	datum_prev_check_done = false;
+	rc = datum_thread_create(&datum_prev_check_tid, datum_prev_check_thread, NULL);
+	if (rc != 0) {
+		DLOG_WARN("Coinbaser: prev-block check: could not start thread (%d)", rc);
+		return;
+	}
+	datum_prev_check_running = true;
 }
 
 void datum_protocol_coinbaser_reuse_reset(void) {
@@ -1495,6 +1756,11 @@ void datum_protocol_coinbaser_reuse_reset(void) {
 	datum_last_good_session = 0;
 	datum_last_good_prime_id = 0;
 	datum_last_good_pool_pubkey[0] = 0;
+	datum_prev_checked = false;
+	datum_prev_pool_block = false;
+	datum_prev_answered = false;
+	memset(datum_prev_checked_tip, 0, sizeof(datum_prev_checked_tip));
+	memset(datum_prev_answered_tip, 0, sizeof(datum_prev_answered_tip));
 	memset(datum_last_good_prevhash, 0, sizeof(datum_last_good_prevhash));
 	memset(datum_last_good_cb_outs, 0, sizeof(datum_last_good_cb_outs));
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
@@ -1526,6 +1792,7 @@ int datum_protocol_coinbaser_take_late(unsigned char *prevhash_out) {
 		n = datum_coinbaser_v2_parse(&scratch, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx]);
 		datum_coinbaser_v2_response = NULL;
 		datum_last_req_unanswered = false;
+		datum_protocol_coinbaser_note_answer(datum_last_req_prevhash);
 		if (n >= 2) {
 			datum_protocol_coinbaser_save_good(&scratch, n);
 			if (prevhash_out) memcpy(prevhash_out, datum_last_req_prevhash, 32);
@@ -1616,6 +1883,13 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
+	if (reuse_on) {
+		/* Read the previous block while the pool answers. The loop below looks
+		 * for an answer before waiting, so none is lost while unlocked. */
+		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+		datum_prev_check_start(s->prevhash_bin);
+		pthread_mutex_lock(&datum_protocol_coinbaser_fetch_mutex);
+	}
 
 	for (;;) {
 		if (datum_coinbaser_v2_response &&
@@ -1628,10 +1902,17 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			if (in_fast_wait) {
 				int seeded;
 				pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+				datum_prev_check_wait(&ts_fast);
 				seeded = datum_protocol_coinbaser_try_reuse(s);
 				if (seeded >= 2) {
 					DLOG_INFO("Coinbaser fast-wait miss: publishing provisional multi (%d outs)", seeded);
 					return seeded;
+				}
+				if (datum_protocol_coinbaser_prev_stale(s->prevhash_bin)) {
+					/* Don't hold the coinbaser thread (and the solo job queued
+					 * behind it) for the full wait; a late answer is still
+					 * applied by take_late. */
+					return 0;
 				}
 				in_fast_wait = false;
 				ts = ts_full;
@@ -1655,13 +1936,15 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		if (i >= 2) {
 			datum_protocol_coinbaser_save_good(s, i);
 		}
+		datum_protocol_coinbaser_note_answer(s->prevhash_bin);
 	}
+	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 	if (reuse_on && i < 2) {
+		// a short answer may beat the check; its verdict decides the stretch
+		datum_prev_check_wait(&ts_fast);
 		int reused = datum_protocol_coinbaser_try_reuse(s);
 		if (reused >= 2) i = reused;
 	}
-
-	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 	return i;
 }
 

@@ -417,14 +417,20 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	 * job is only built once a split from this pool is held. Before that, on
 	 * first connection or after switching pool, the job pays
 	 * mining.pool_address instead of the pool's script alone. The coinbaser
-	 * thread still asks the pool, and replaces this work once it answers. */
-	const bool solo_until_first_split = datum_protocol_is_active() &&
+	 * thread still asks the pool, and replaces this work once it answers.
+	 * The same holds when the pool found the previous block: the saved split
+	 * is stale and is not reused until the pool answers for this tip. */
+	const bool solo_allowed = datum_protocol_is_active() &&
 		datum_config.datum_coinbaser_reuse &&
 		!datum_config.datum_pooled_mining_only &&
-		datum_config.mining_pool_address[0] &&
-		!datum_protocol_coinbaser_have_saved();
-	if (solo_until_first_split) {
+		datum_config.mining_pool_address[0];
+	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
+	const bool pool_found_prev = solo_allowed && !no_split && datum_protocol_coinbaser_prev_pool_block(s->prevhash_bin);
+	const bool solo_until_first_split = no_split || pool_found_prev;
+	if (no_split) {
 		DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
+	} else if (pool_found_prev) {
+		DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
 	}
 	if (datum_protocol_is_active() && !solo_until_first_split) {
 		// DATUM
