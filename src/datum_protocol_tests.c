@@ -42,6 +42,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include "datum_blocktemplates.h"
 #include "datum_coinbaser.h"
 #include "datum_conf.h"
 #include "datum_pow.h"
@@ -1019,6 +1020,7 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(job.datum_coinbaser_id == 7);
 
 	// A stretched split does not claim the pool's id.
+	datum_protocol_coinbaser_prev_record(tip_b, 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	job.coinbase_value = 800000000;
@@ -1125,10 +1127,13 @@ static void datum_coinbaser_reuse_same_tip_tests(void) {
 	datum_test(job.available_coinbase_outputs[0].value_sats == 1000);
 	datum_test(job.available_coinbase_outputs[2].value_sats == 1002);
 
+	// Not stretched onto a new tip until its previous block is read.
 	memcpy(job.prevhash_bin, tip_b, 32);
 	memset(job.available_coinbase_outputs, 0, sizeof(job.available_coinbase_outputs));
 	job.available_coinbase_outputs_count = 0;
 	job.coinbase_value = 6006;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_protocol_coinbaser_prev_record(tip_b, 1);
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
 	datum_test(job.available_coinbase_outputs_count == 3);
 	sum = 0;
@@ -1806,15 +1811,17 @@ static void datum_protocol_job_validation_bounds_test(void) {
 	free(req);
 }
 
-/* A block whose coinbase pays the given 22-byte P2WPKH scripts (fill bytes),
- * plus a witness commitment and a script too long to be a split output. */
-static size_t datum_prev_test_block(char *hex, size_t cap, const unsigned char *fills, int nfill, bool segwit, bool blake2b) {
+/* A block on parent whose coinbase pays the given 22-byte P2WPKH scripts
+ * (fill bytes), plus a witness commitment and a script too long to be a
+ * split output. */
+static size_t datum_prev_test_block(char *hex, size_t cap, const unsigned char *parent, const unsigned char *fills, int nfill, bool segwit, bool blake2b) {
 	unsigned char b[1024];
 	size_t k = 0, i;
 	int o;
 	k = blake2b ? DATUM_BLAKE2B_BLOCK_HEADER_SIZE : 80;
 	memset(b, 0x11, k); // header
 	b[3] = blake2b ? 0xa0 : 0x20;
+	memcpy(&b[4], parent, 32);
 	b[k++] = 2; // txs (only the coinbase is read)
 	pk_u32le(b, k, 2); k += 4;
 	if (segwit) { b[k++] = 0; b[k++] = 1; }
@@ -1935,6 +1942,7 @@ static bool datum_prev_test_serve(T_DATUM_PREV_TEST_SERVER *server, const unsign
 }
 
 static void datum_prev_test_unserve(T_DATUM_PREV_TEST_SERVER *server) {
+	shutdown(server->listen_fd, SHUT_RDWR); // fail, not hang, when no getblock came
 	pthread_join(server->thread, NULL);
 	close(server->listen_fd);
 }
@@ -1990,6 +1998,8 @@ static int datum_prev_test_fetch(T_DATUM_STRATUM_JOB *job, bool answer, uint64_t
 	return r;
 }
 
+#define DATUM_PREV_TEST_UNREAD (-1)
+
 static void datum_coinbaser_prev_block_fetch_tests(void) {
 	const global_config_t saved_config = datum_config;
 	const int saved_active = atomic_load(&datum_protocol_client_active);
@@ -1998,12 +2008,15 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	unsigned char saved_nonce[crypto_box_NONCEBYTES];
 	const unsigned char split[3] = { 0x30, 0x31, 0x32 };
 	const unsigned char paid_two[2] = { 0x31, 0x30 };
+	const unsigned char paid_one[2] = { 0x30, 0x40 };
 	const unsigned char fresh[2] = { 0x50, 0x51 };
-	unsigned char tip_a[32], tip_b[32], tip_c[32], tip_d[32], tip_e[32], got[32];
+	unsigned char tip_a[32], tip_b[32], tip_c[32], tip_d[32], tip_e[32], tip_f[32], tip_g[32], got[32];
 	static T_DATUM_STRATUM_JOB job;
 	static char pool_hex[2048];
+	static char other_hex[2048];
 	T_DATUM_PREV_TEST_SERVER server;
 	uint64_t ms = 0;
+	uint64_t start;
 	int r;
 
 	memcpy(saved_nonce, session_nonce_sender, sizeof(saved_nonce));
@@ -2012,7 +2025,10 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	memset(tip_c, 0xc6, 32);
 	memset(tip_d, 0xd7, 32);
 	memset(tip_e, 0xe8, 32);
-	datum_test(datum_prev_test_block(pool_hex, sizeof(pool_hex), paid_two, 2, true, true) > 0);
+	memset(tip_f, 0xf9, 32);
+	memset(tip_g, 0x6a, 32);
+	datum_test(datum_prev_test_block(pool_hex, sizeof(pool_hex), tip_a, paid_two, 2, true, true) > 0);
+	datum_test(datum_prev_test_block(other_hex, sizeof(other_hex), tip_a, paid_one, 2, true, true) > 0);
 	atomic_store(&datum_protocol_client_active, 3);
 	datum_config.datum_coinbaser_reuse = true;
 	datum_config.datum_pooled_mining_only = true;
@@ -2024,6 +2040,7 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	job.coinbase_value = 310000000;
+	job.is_datum_job = true;
 	datum_prev_test_serve(&server, tip_b, pool_hex, 0);
 	r = datum_prev_test_fetch(&job, false, &ms);
 	datum_prev_check_wait(NULL);
@@ -2031,13 +2048,13 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	datum_test(server.saw_getblock);
 	datum_test(r == 0);
 	datum_test(ms >= 400 && ms < 2500);
-	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 1);
 	// Its late answer is applied, ending solo and the skip.
 	datum_prev_test_answer(310000000, fresh, 2);
 	datum_test(datum_protocol_coinbaser_fetch_response(datum_prev_test_resp_len, datum_prev_test_resp) == 1);
 	datum_test(datum_protocol_coinbaser_take_late(got) == 2);
 	datum_test(memcmp(got, tip_b, 32) == 0);
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	job.coinbase_value = 310000000;
@@ -2049,6 +2066,7 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_c, 32);
 	job.coinbase_value = 310000000;
+	job.is_datum_job = true;
 	datum_prev_test_answer(310000000, fresh, 2);
 	datum_prev_test_serve(&server, tip_c, pool_hex, 400);
 	r = datum_prev_test_fetch(&job, true, &ms);
@@ -2058,7 +2076,7 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	datum_prev_test_unserve(&server);
 	datum_test(server.saw_getblock);
 	// The pool's own split for the tip is held, so the check's verdict is moot.
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_c, 32);
 	job.coinbase_value = 310000000;
@@ -2071,36 +2089,130 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_d, 32);
 	job.coinbase_value = 310000000;
+	job.is_datum_job = true;
 	datum_prev_test_answer(310000000, fresh, 1);
 	datum_prev_test_serve(&server, tip_d, pool_hex, 300);
 	r = datum_prev_test_fetch(&job, true, &ms);
 	datum_prev_test_unserve(&server);
 	datum_test(r < 2);
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_d));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_d) == 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_d, 32);
 	job.coinbase_value = 310000000;
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
 
-	// A getblock slower than the fast wait does not hold the fetch: the
-	// verdict is unknown at the miss, and applies once the check ends.
+	// A getblock slower than the fast wait: the split is not stretched while
+	// the verdict is unknown, and the pool's block keeps it off afterwards.
 	datum_prev_check_wait(NULL);
 	datum_protocol_coinbaser_reuse_reset();
 	datum_prev_test_save(&job, tip_a, split, 3);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_e, 32);
 	job.coinbase_value = 310000000;
+	job.is_datum_job = true;
 	datum_prev_test_serve(&server, tip_e, pool_hex, 1500);
 	r = datum_prev_test_fetch(&job, false, &ms);
-	datum_test(r == 3);
-	datum_test(ms >= 400 && ms < 1200);
+	datum_test(r == 0);
+	datum_test(ms >= 1400 && ms < 2500);
 	datum_prev_check_wait(NULL);
 	datum_prev_test_unserve(&server);
-	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_e));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_e) == 1);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_e, 32);
 	job.coinbase_value = 310000000;
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	// Not the pool's, after the fast wait: stretched as soon as it is known.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_e, 32);
+	job.coinbase_value = 310000000;
+	job.is_datum_job = true;
+	datum_prev_test_serve(&server, tip_e, other_hex, 700);
+	r = datum_prev_test_fetch(&job, false, &ms);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(r == 3);
+	datum_test(ms >= 650 && ms < 1500);
+
+	// Solo work is not held for the pool: the fetch asks and returns at once.
+	// A slow verdict that the block was not the pool's then allows the stretch.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_f) == 2);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_f, 32);
+	job.coinbase_value = 310000000;
+	datum_prev_test_serve(&server, tip_f, other_hex, 300);
+	datum_blocktemplates_take_refresh();
+	r = datum_prev_test_fetch(&job, false, &ms);
+	datum_test(r == 0);
+	datum_test(ms < 100);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_f) == 2);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(datum_blocktemplates_take_refresh()); // solo work moves back to the pool
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_f) == 0);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_f, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+
+	// The opening job's wait: a fast check decides before the job is built,
+	// a slow one is given up on after the wait and decides when it ends.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	datum_prev_test_serve(&server, tip_g, pool_hex, 0);
+	datum_protocol_coinbaser_prev_check(tip_g, 1000);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 1);
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	datum_prev_test_serve(&server, tip_g, other_hex, 300);
+	start = current_time_millis();
+	datum_protocol_coinbaser_prev_check(tip_g, 50);
+	ms = current_time_millis() - start;
+	datum_test(ms >= 40 && ms < 250);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 2);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 0);
+	// Once pooled work has replaced the solo work, a verdict does not refresh.
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 0);
+	datum_protocol_coinbaser_prev_record(tip_g, DATUM_PREV_TEST_UNREAD);
+	datum_prev_test_serve(&server, tip_g, other_hex, 0);
+	datum_blocktemplates_take_refresh();
+	datum_protocol_coinbaser_prev_check(tip_g, 1000);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(!datum_blocktemplates_take_refresh());
+	// While it is still solo, the verdict does.
+	datum_protocol_coinbaser_prev_record(tip_g, DATUM_PREV_TEST_UNREAD);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 2);
+	datum_prev_test_serve(&server, tip_g, other_hex, 0);
+	datum_protocol_coinbaser_prev_check(tip_g, 1000);
+	datum_prev_test_unserve(&server);
+	datum_test(datum_blocktemplates_take_refresh());
+
+	// A split saved while the block is read: the verdict is dropped and the
+	// block is read again against the new split.
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	datum_prev_test_serve(&server, tip_g, other_hex, 300);
+	datum_protocol_coinbaser_prev_check(tip_g, 0);
+	usleep(100000); // inside the 300ms getblock
+	datum_prev_test_save(&job, tip_a, split, 3);
+	datum_prev_check_wait(NULL);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 2);
+	datum_prev_test_serve(&server, tip_g, other_hex, 0);
+	datum_protocol_coinbaser_prev_check(tip_g, 1000);
+	datum_prev_test_unserve(&server);
+	datum_test(server.saw_getblock);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 0);
 
 	datum_prev_check_wait(NULL);
 	datum_protocol_coinbaser_reuse_reset();
@@ -2134,36 +2246,40 @@ static void datum_coinbaser_prev_block_tests(void) {
 	const unsigned char split[3] = { 0x30, 0x31, 0x32 };
 	const unsigned char paid_two[2] = { 0x31, 0x30 };
 	const unsigned char paid_one[2] = { 0x30, 0x40 };
-	unsigned char tip_a[32], tip_b[32], tip_c[32];
+	unsigned char tip_a[32], tip_b[32], tip_c[32], tip_d[32];
 	static T_DATUM_STRATUM_JOB job;
 	char hex[2048];
+	unsigned char parent[32];
 	bool saw = false;
 	size_t len;
 
 	memset(tip_a, 0xa1, 32);
 	memset(tip_b, 0xb2, 32);
 	memset(tip_c, 0xc3, 32);
+	memset(tip_d, 0xd4, 32);
 	datum_protocol_coinbaser_reuse_reset();
 	datum_prev_test_save(&job, tip_a, split, 3);
 
 	// Parser: only the coinbase outputs count, with and without witness serialization.
-	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, true);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_two, 2, true, true);
 	datum_test(len > 0);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 2, job.available_coinbase_outputs, 3) == 2);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 1, job.available_coinbase_outputs, 3) == -1);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, 400, job.available_coinbase_outputs, 3) == -1);
+	memset(parent, 0, 32);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) == 2);
+	datum_test(memcmp(parent, tip_a, 32) == 0);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 2, job.available_coinbase_outputs, 3, parent) == 2);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len - 1, job.available_coinbase_outputs, 3, parent) == -1);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, 400, job.available_coinbase_outputs, 3, parent) == -1);
 	hex[2 * 230] = 'z'; // inside the first output script
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == -1);
-	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, false, true);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
-	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, false);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 2);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) == -1);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_two, 2, false, true);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) == 2);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_two, 2, true, false);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) == 2);
 	hex[6] = 'a'; // an 80-byte header read as blake2b
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) != 2);
-	len = datum_prev_test_block(hex, sizeof(hex), paid_one, 2, true, true);
-	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3) == 1);
-	datum_test(datum_protocol_coinbaser_prev_block_matches("", 0, job.available_coinbase_outputs, 3) == -1);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) != 2);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_one, 2, true, true);
+	datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent) == 1);
+	datum_test(datum_protocol_coinbaser_prev_block_matches("", 0, job.available_coinbase_outputs, 3, parent) == -1);
 
 	// No new tip: the saved split is for this tip, so bitcoind is not asked.
 	memset(&job, 0, sizeof(job));
@@ -2171,12 +2287,12 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(!datum_protocol_coinbaser_check_prev_block(job.prevhash_bin));
 
 	// The pool's block on tip_b: the split is not stretched onto tip_b.
-	len = datum_prev_test_block(hex, sizeof(hex), paid_two, 2, true, true);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_two, 2, true, true);
 	memcpy(job.prevhash_bin, tip_b, 32);
 	datum_test(datum_prev_test_check(&job, hex, &saw));
 	datum_test(saw);
-	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 1);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 2);
 	{
 		// Work on tip_b pays mining.pool_address unless pooled_mining_only is set.
 		const int saved_active = atomic_load(&datum_protocol_client_active);
@@ -2192,10 +2308,17 @@ static void datum_coinbaser_prev_block_tests(void) {
 		datum_config.override_mining_pool_scriptpubkey[0] = 0x51;
 		datum_config.override_mining_pool_scriptpubkey_len = 1;
 		datum_test(!datum_prev_test_base_is_datum(tip_b));
-		datum_test(datum_prev_test_base_is_datum(tip_c));
+		// unverified, then not the pool's, then unreadable
+		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_protocol_coinbaser_prev_record(tip_d, 1);
+		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_protocol_coinbaser_prev_record(tip_d, -1);
+		datum_test(!datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = true;
 		datum_test(datum_prev_test_base_is_datum(tip_b));
+		datum_test(datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = false;
+		datum_protocol_coinbaser_prev_record(tip_b, 2);
 		datum_protocol_abw_reset();
 		atomic_store(&datum_protocol_client_active, saved_active);
 	}
@@ -2204,16 +2327,16 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(job.available_coinbase_outputs_count == 0);
 	// Checked once per tip: no second request.
 	datum_test(!datum_protocol_coinbaser_check_prev_block(job.prevhash_bin));
-	datum_test(datum_protocol_coinbaser_prev_pool_block(tip_b));
-	// Another tip still reuses the split.
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 1);
+	// An unchecked tip does not reuse the split either.
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_c, 32);
 	job.coinbase_value = 310000000;
-	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
 
 	// The pool's answer for tip_b ends the skip and is reused exactly.
 	datum_prev_test_save(&job, tip_b, split, 3);
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	job.coinbase_value = 300000000;
@@ -2221,23 +2344,59 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(job.datum_coinbaser_id == 5);
 
 	// A block paying only one split script is not the pool's.
-	len = datum_prev_test_block(hex, sizeof(hex), paid_one, 2, true, true);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_b, paid_one, 2, true, true);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_c, 32);
 	datum_test(!datum_prev_test_check(&job, hex, &saw));
 	datum_test(saw);
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_c));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 0);
 	job.coinbase_value = 310000000;
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+	// The verdict is about the split saved then: a different split saved
+	// afterwards (here a late answer for another tip) is not stretched on it.
+	datum_prev_test_save(&job, tip_d, split, 3);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 2);
+	// The block is read again against the new split.
+	len = datum_prev_test_block(hex, sizeof(hex), tip_d, paid_one, 2, true, true);
+	datum_test(!datum_prev_test_check(&job, hex, &saw));
+	datum_test(saw);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 0);
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
 
-	// An unreadable block is not the pool's.
+	// A block not built on the split's tip: a block in between may have been
+	// the pool's, so the split stays unverified for the tip (checked once).
+	datum_protocol_coinbaser_reuse_reset();
+	datum_prev_test_save(&job, tip_a, split, 3);
+	len = datum_prev_test_block(hex, sizeof(hex), tip_b, paid_one, 2, true, true);
+	memset(&job, 0, sizeof(job));
+	memcpy(job.prevhash_bin, tip_c, 32);
+	datum_test(!datum_prev_test_check(&job, hex, &saw));
+	datum_test(saw);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 2);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_test(!datum_protocol_coinbaser_check_prev_block(tip_c));
+
+	// An unreadable block stays unverified: no stretch, and solo work.
 	datum_protocol_coinbaser_reuse_reset();
 	datum_prev_test_save(&job, tip_a, split, 3);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	datum_test(!datum_prev_test_check(&job, "00zz", &saw));
 	datum_test(saw);
-	datum_test(!datum_protocol_coinbaser_prev_pool_block(tip_b));
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 2);
+	job.coinbase_value = 310000000;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	// It is read again on the next try.
+	len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_one, 2, true, true);
+	datum_test(!datum_prev_test_check(&job, hex, &saw));
+	datum_test(saw);
+	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 0);
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
 
 	datum_protocol_coinbaser_reuse_reset();
 	datum_config = saved_config;

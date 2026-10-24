@@ -205,5 +205,6 @@ void datum_blocktemplates_notifynew_sighandler();
 void datum_blocktemplates_notifynew(const char *prevhash, int height);
 void datum_blocktemplates_notify_othercause();
 void datum_blocktemplates_notify_refresh(void);
+bool datum_blocktemplates_take_refresh(void);
 
 #endif

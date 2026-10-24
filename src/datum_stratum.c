@@ -2050,6 +2050,14 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	// start as not a datum job.  if we have coinbase data and such for it down the line, this will get updated.
 	s->is_datum_job = false;
 	
+	/* With coinbaser_reuse, the opening job of a new tip waits up to 50ms for
+	 * the previous-block check, so the saved split is never stretched onto a
+	 * tip whose previous block the pool found. A slower check leaves the job
+	 * solo (when allowed) until it ends or the pool answers. */
+	if (new_block && datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+		datum_protocol_coinbaser_prev_check(s->prevhash_bin, 50);
+	}
+
 	// prep the coinbase txn(s) for this job
 	generate_base_coinbase_txns_for_stratum_job(s, s->is_new_block);
 
