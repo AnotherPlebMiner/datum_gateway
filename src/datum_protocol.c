@@ -1609,19 +1609,22 @@ static bool datum_prev_hex_varint(const char *hex, size_t nbytes, size_t *pos, u
 }
 
 /* Counts the saved outputs paid by the first (coinbase) transaction of a
- * hex-encoded block, and copies the header's previous block hash to parent.
- * Only the header and coinbase are read. -1 if they cannot be parsed.
+ * hex-encoded block, copies the header's previous block hash to parent, and
+ * sets paid_pool when an output pays pool_script (the pool's own payout,
+ * which a pool-only coinbase pays alone). Only the header and coinbase are
+ * read. -1 if they cannot be parsed.
  * Version bit 31 marks the blake2b header; otherwise the header is 80 bytes.
  * Both carry the previous block hash at offset 4. */
-int datum_protocol_coinbaser_prev_block_matches(const char *hex, size_t hex_len, const T_DATUM_TXN_OUTPUT *outs, int n, unsigned char *parent) {
+int datum_protocol_coinbaser_prev_block_matches(const char *hex, size_t hex_len, const T_DATUM_TXN_OUTPUT *outs, int n, unsigned char *parent, const unsigned char *pool_script, int pool_len, bool *paid_pool) {
 	bool hit[512] = { false };
-	unsigned char script[64];
+	unsigned char script[MAX_OUTPUT_SCRIPT_LEN];
 	unsigned char b;
 	const size_t nbytes = hex_len / 2;
 	size_t pos = 0;
 	uint64_t count, vout, slen, o, k;
 	int matched = 0;
 	int i;
+	*paid_pool = false;
 	if (!hex || (hex_len & 1) || n < 0 || n > 512) return -1;
 	pos = 3;
 	if (!datum_prev_hex_byte(hex, nbytes, &pos, &b)) return -1;
@@ -1653,6 +1656,9 @@ int datum_protocol_coinbaser_prev_block_matches(const char *hex, size_t hex_len,
 		}
 		for (k = 0; k < slen; k++) {
 			if (!datum_prev_hex_byte(hex, nbytes, &pos, &script[k])) return -1;
+		}
+		if (pool_len > 0 && (uint64_t)pool_len == slen && memcmp(pool_script, script, (size_t)slen) == 0) {
+			*paid_pool = true;
 		}
 		for (i = 0; i < n; i++) {
 			if (!hit[i] && (uint64_t)outs[i].output_script_len == slen &&
@@ -1716,6 +1722,10 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	char tip_hex[65];
 	unsigned char split_tip[32];
 	unsigned char parent[32];
+	unsigned char pool_script[sizeof(datum_config.override_mining_pool_scriptpubkey)];
+	int pool_len = 0;
+	bool paid_pool = false;
+	bool pool_block;
 	json_t *r = NULL;
 	const char *hex;
 	uint64_t start;
@@ -1729,6 +1739,9 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 		n = datum_last_good_cb_count;
 		memcpy(split_tip, datum_last_good_prevhash, 32);
 		gen = datum_last_good_gen;
+		pool_len = datum_config.override_mining_pool_scriptpubkey_len;
+		if (pool_len < 0 || pool_len > (int)sizeof(pool_script)) pool_len = 0;
+		memcpy(pool_script, datum_config.override_mining_pool_scriptpubkey, (size_t)pool_len);
 	}
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
 	if (n < 2) return false;
@@ -1742,14 +1755,15 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	if (!curl) curl = curl_easy_init();
 	if (curl) r = bitcoind_json_rpc_call(curl, &datum_config, req);
 	hex = r ? json_string_value(json_object_get(r, "result")) : NULL;
-	if (hex) matched = datum_protocol_coinbaser_prev_block_matches(hex, strlen(hex), outs, n, parent);
+	if (hex) matched = datum_protocol_coinbaser_prev_block_matches(hex, strlen(hex), outs, n, parent, pool_script, pool_len, &paid_pool);
 	if (r) json_decref(r);
+	pool_block = matched >= 2 || (matched >= 0 && paid_pool);
 	// a split older than the block's parent may have been paid by a block in between
-	const bool not_child = matched >= 0 && matched < 2 && memcmp(parent, split_tip, 32) != 0;
+	const bool not_child = matched >= 0 && !pool_block && memcmp(parent, split_tip, 32) != 0;
 
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
 	// a split saved while bitcoind was asked is not the one this read is about: read again
-	datum_prev_record_locked(tip, gen != datum_last_good_gen ? DATUM_PREV_UNREAD : not_child ? DATUM_PREV_NOT_CHILD : matched);
+	datum_prev_record_locked(tip, gen != datum_last_good_gen ? DATUM_PREV_UNREAD : not_child ? DATUM_PREV_NOT_CHILD : (pool_block && matched < 2) ? 2 : matched);
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
 	datum_prev_check_wake_fetch();
 
@@ -1758,9 +1772,9 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	} else if (not_child) {
 		DLOG_INFO("Coinbaser: prev-block check: pool block=unknown in %" PRIu64 " ms (not built on the split's tip)", current_time_millis() - start);
 	} else {
-		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid)", (matched >= 2) ? "yes" : "no", current_time_millis() - start, matched, n);
+		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid%s)", pool_block ? "yes" : "no", current_time_millis() - start, matched, n, paid_pool ? ", pool script paid" : "");
 	}
-	return matched >= 2;
+	return pool_block;
 }
 
 /* The check runs on its own thread, one at a time, so it overlaps the fast
