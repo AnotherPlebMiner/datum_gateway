@@ -429,6 +429,19 @@ bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM
 	return false;
 }
 
+// Same tip: miners stay on the prior job until this one has its coinbaser,
+// rather than taking it with a coinbase the pool did not issue.
+bool datum_stratum_holds_job(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job) {
+	bool waiting;
+	
+	if (job->is_new_block || sdata->last_job_height != job->height) return false;
+	if (sdata->cur_stratum_job && sdata->cur_stratum_job->is_stale_prevblock) return false;
+	pthread_rwlock_rdlock(&need_coinbaser_rwlocks[job->global_index]);
+	waiting = job->need_coinbaser;
+	pthread_rwlock_unlock(&need_coinbaser_rwlocks[job->global_index]);
+	return waiting;
+}
+
 void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 	T_DATUM_STRATUM_THREADPOOL_DATA *sdata = (T_DATUM_STRATUM_THREADPOOL_DATA *)my->app_thread_data;
 	T_DATUM_STRATUM_JOB *job = NULL;
@@ -441,19 +454,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 	// check if the stratum job has been updated
 	pthread_rwlock_rdlock(&stratum_global_job_ptr_lock);
 	if (global_latest_stratum_job_index != sdata->latest_stratum_job_index) {
-		change_ready = true;
-		if ((sdata->last_was_empty) && (global_cur_stratum_jobs[global_latest_stratum_job_index]->job_state >= JOB_STATE_FULL_PRIORITY_WAIT_COINBASER)) {
-			// we went from an empty to a coinbaser wait job somehow...
-			// we don't want to delay our full work blast, however...
-			if (!stratum_job_coinbaser_ready(sdata,global_cur_stratum_jobs[global_latest_stratum_job_index])) {
-				// yeah, it's not ready.  let's just pretend we didn't see this job yet...
-				// ... unless it's a different block height and we're somehow _that_ far behind on processing.
-				// should never happen, but let's be careful.
-				if (sdata->last_job_height == global_cur_stratum_jobs[global_latest_stratum_job_index]->height) {
-					change_ready = false;
-				}
-			}
-		}
+		change_ready = !datum_stratum_holds_job(sdata, global_cur_stratum_jobs[global_latest_stratum_job_index]);
 		
 		if (change_ready) {
 			sdata->cur_stratum_job = global_cur_stratum_jobs[global_latest_stratum_job_index];
@@ -1047,6 +1048,12 @@ static void stratum_note_share(T_DATUM_MINER_DATA *m, bool accepted, uint64_t di
 	}
 }
 
+// The pool rejects shares on a coinbase paying its old script (after a reconfigure)
+bool datum_job_pays_current_pool(const T_DATUM_STRATUM_JOB *job) {
+	return job->pool_addr_script_len == datum_config.override_mining_pool_scriptpubkey_len &&
+	       !memcmp(job->pool_addr_script, datum_config.override_mining_pool_scriptpubkey, job->pool_addr_script_len);
+}
+
 int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj) {
 	// {"params": ["username", "job", "extranonce2", "time", "nonce"], "id": 1, "method": "mining.submit"}
 	// 0 = username
@@ -1317,6 +1324,11 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 	}
 	
 	// work accepted
+	if (job->is_datum_job && !was_block && !datum_job_pays_current_pool(job)) {
+		send_rejected_stale(c, id);
+		stratum_note_share(m, false, job_diff);
+		return 0;
+	}
 	if (job->is_datum_job && !was_block && datum_protocol_pow_submit(c, job,
 		username_s, false, empty_work, quickdiff, block_header, job_diff, full_cb_txn,
 		full_cb_txn_size, share_hash, cb, extranonce_bin,

@@ -2096,6 +2096,8 @@ err:
 	a = data[i]; i++;
 	if (!a || a > MAX_OUTPUT_SCRIPT_LEN) goto err;
 	if (i + a > len) goto err;
+	const bool pool_script_changed = a != datum_config.override_mining_pool_scriptpubkey_len ||
+		memcmp(datum_config.override_mining_pool_scriptpubkey, &data[i], a) != 0;
 	memcpy(datum_config.override_mining_pool_scriptpubkey, &data[i], a); i+=a;
 	datum_config.override_mining_pool_scriptpubkey_len = a;
 	
@@ -2190,7 +2192,8 @@ err:
 	} else if (first_configuration && datum_requested_resume) {
 		DLOG_WARN("DATUM resume was declined; discarded queued shares from the old session");
 	}
-	if (became_ready || abw_policy_changed)
+	// jobs paying the old script get their shares rejected until new work
+	if (became_ready || abw_policy_changed || pool_script_changed)
 		datum_blocktemplates_notify_othercause();
 	
 	return 1;

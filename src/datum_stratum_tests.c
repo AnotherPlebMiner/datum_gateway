@@ -720,7 +720,119 @@ static void datum_stratum_notify_replaces_job_tests(void) {
 	datum_test(!datum_stratum_notify_replaces_job(JOB_STATE_FULL_PRIORITY, false));
 }
 
+static void datum_stratum_holds_job_tests(void) {
+	T_DATUM_STRATUM_THREADPOOL_DATA * const sdata = calloc(1, sizeof(*sdata));
+	T_DATUM_STRATUM_JOB job = {0};
+	
+	datum_test(sdata != NULL);
+	if (!sdata) return;
+	datum_stratum_test_coinbaser_locks();
+	sdata->last_job_height = 12345;
+	job.height = 12345;
+	job.need_coinbaser = true;
+	// Same tip, coinbaser not here: stay on the prior job
+	datum_test(datum_stratum_holds_job(sdata, &job));
+	// unless that job is on a tip that was replaced at this height
+	T_DATUM_STRATUM_JOB prior = {0};
+	prior.is_stale_prevblock = true;
+	sdata->cur_stratum_job = &prior;
+	datum_test(!datum_stratum_holds_job(sdata, &job));
+	prior.is_stale_prevblock = false;
+	datum_test(datum_stratum_holds_job(sdata, &job));
+	job.need_coinbaser = false;
+	datum_test(!datum_stratum_holds_job(sdata, &job));
+	// A new tip, at a new height or the same one, is never held
+	job.need_coinbaser = true;
+	job.height = 12346;
+	datum_test(!datum_stratum_holds_job(sdata, &job));
+	job.height = 12345;
+	job.is_new_block = true;
+	datum_test(!datum_stratum_holds_job(sdata, &job));
+	free(sdata);
+}
+
+static void datum_stratum_loop_holds_job_tests(void) {
+	T_DATUM_THREAD_DATA * const thread = calloc(1, sizeof(*thread));
+	T_DATUM_STRATUM_THREADPOOL_DATA * const sdata = calloc(1, sizeof(*sdata));
+	T_DATUM_SOCKET_APP app = {0};
+	T_DATUM_TEMPLATE_DATA tdata = {0};
+	T_DATUM_STRATUM_JOB job = {0}, next = {0};
+	const global_config_t saved_config = datum_config;
+	const int saved_latest_index = global_latest_stratum_job_index;
+	T_DATUM_STRATUM_JOB * const saved_jobs[2] = { global_cur_stratum_jobs[0], global_cur_stratum_jobs[1] };
+	
+	datum_test(thread != NULL);
+	datum_test(sdata != NULL);
+	if (!(thread && sdata)) {
+		free(thread);
+		free(sdata);
+		return;
+	}
+	datum_stratum_test_coinbaser_locks();
+	datum_config.stratum_v1_max_clients_per_thread = 1;
+	datum_config.bitcoind_work_update_seconds = 40;
+	tdata.height = 12345;
+	job.block_template = &tdata;
+	job.job_state = JOB_STATE_FULL_PRIORITY;
+	job.height = 12345;
+	job.tsms = current_time_millis() - 10000;
+	next = job;
+	next.global_index = 1;
+	next.job_state = JOB_STATE_FULL_NORMAL_WAIT_COINBASER;
+	next.need_coinbaser = true;
+	global_cur_stratum_jobs[0] = &job;
+	global_cur_stratum_jobs[1] = &next;
+	global_latest_stratum_job_index = 0;
+	
+	app.max_threads = 1;
+	app.max_clients_thread = 1;
+	thread->app = &app;
+	thread->app_thread_data = sdata;
+	datum_stratum_v1_socket_thread_init(thread);
+	datum_stratum_v1_socket_thread_loop(thread);
+	datum_test(sdata->cur_stratum_job == &job);
+	
+	// A same-tip refresh past the 5 second fallback is not taken without its coinbaser
+	global_latest_stratum_job_index = 1;
+	datum_stratum_v1_socket_thread_loop(thread);
+	datum_test(sdata->cur_stratum_job == &job);
+	next.need_coinbaser = false;
+	datum_stratum_v1_socket_thread_loop(thread);
+	datum_test(sdata->cur_stratum_job == &next);
+	
+	T_DATUM_STRATUM_DUPES * const dupes = sdata->dupes;
+	if (dupes) free(dupes->ptr);
+	free(dupes);
+	global_cur_stratum_jobs[0] = saved_jobs[0];
+	global_cur_stratum_jobs[1] = saved_jobs[1];
+	global_latest_stratum_job_index = saved_latest_index;
+	datum_config = saved_config;
+	free(sdata);
+	free(thread);
+}
+
+static void datum_job_pays_current_pool_tests(void) {
+	T_DATUM_STRATUM_JOB job = {0};
+	const global_config_t saved_config = datum_config;
+	
+	datum_config.override_mining_pool_scriptpubkey_len = 22;
+	memset(datum_config.override_mining_pool_scriptpubkey, 0x51, 22);
+	job.pool_addr_script_len = 22;
+	memset(job.pool_addr_script, 0x51, 22);
+	datum_test(datum_job_pays_current_pool(&job));
+	// The pool reconfigured with a new script after this job was built
+	datum_config.override_mining_pool_scriptpubkey[21] = 0x52;
+	datum_test(!datum_job_pays_current_pool(&job));
+	datum_config.override_mining_pool_scriptpubkey[21] = 0x51;
+	datum_config.override_mining_pool_scriptpubkey_len = 34;
+	datum_test(!datum_job_pays_current_pool(&job));
+	datum_config = saved_config;
+}
+
 void datum_stratum_tests(void) {
+	datum_stratum_holds_job_tests();
+	datum_stratum_loop_holds_job_tests();
+	datum_job_pays_current_pool_tests();
 	datum_stratum_notify_replaces_job_tests();
 	datum_stratum_mod_username_tests();
 	datum_stratum_minimum_difficulty_configure_tests();

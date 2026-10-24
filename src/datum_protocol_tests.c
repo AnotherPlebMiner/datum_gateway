@@ -52,6 +52,7 @@
 
 extern DATUM_QUEUE pow_queue;
 extern atomic_int new_notify_threadsafe;
+extern atomic_int notify_othercause;
 extern volatile char new_notify_blockhash[256];
 extern DATUM_ENC_KEYS local_datum_keys, session_datum_keys;
 extern DATUM_ENC_KEYS session_remote_datum_keys, pool_keys;
@@ -603,6 +604,16 @@ static void datum_protocol_config_v3_tests(void) {
 	datum_test(datum_config.override_mining_pool_scriptpubkey[0] == 0x51);
 	datum_test(!strcmp(datum_config.override_mining_coinbase_tag_primary, "tag"));
 	datum_test(datum_config.override_vardiff_min == 1024);
+	// Same script: no new work. A new script: jobs paying the old one are replaced
+	atomic_store(&notify_othercause, 0);
+	datum_test(datum_protocol_client_configure((int)i, payload));
+	datum_test(atomic_load(&notify_othercause) == 0);
+	payload[2] = 0x52;
+	datum_test(datum_protocol_client_configure((int)i, payload));
+	datum_test(atomic_load(&notify_othercause) == 1);
+	datum_test(datum_config.override_mining_pool_scriptpubkey[0] == 0x52);
+	payload[2] = 0x51;
+	atomic_store(&notify_othercause, 0);
 	pk_u64le(payload, vardiff_min, 0);
 	datum_test(datum_protocol_client_configure((int)i, payload));
 	datum_test(datum_config.override_vardiff_min == 1);

@@ -276,6 +276,8 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
  * and the split reply replace it. A later refresh does not. The replaced
  * job is not marked stale, so shares already submitted still count. */
 bool datum_stratum_notify_replaces_job(int job_state, bool opening_job_still_current);
+bool datum_stratum_holds_job(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job);
+bool datum_job_pays_current_pool(const T_DATUM_STRATUM_JOB *job);
 void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, int job_state);
 void datum_stratum_job_refresh_blake2b(T_DATUM_STRATUM_JOB *s);
 bool datum_stratum_job_blake2b_commitment_from_txn(const T_DATUM_STRATUM_JOB *s, const unsigned char *cb_txn, size_t cb_len, unsigned char target_pot, bool subsidy_only, unsigned char *commitment);
