@@ -1065,13 +1065,13 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
 	datum_test(job.datum_coinbaser_id == 7);
 
-	// A stretched split does not claim the pool's id.
+	// A stretched split carries the saved split's id, so the pool can find what it issued.
 	datum_protocol_coinbaser_prev_record(tip_b, 0);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_b, 32);
 	job.coinbase_value = 800000000;
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
-	datum_test(job.datum_coinbaser_id == 0);
+	datum_test(job.datum_coinbaser_id == 7);
 	datum_test(job.available_coinbase_outputs[0].value_sats + job.available_coinbase_outputs[1].value_sats == 800000000);
 
 	// A new session does not reuse the saved split.

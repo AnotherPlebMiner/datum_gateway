@@ -1569,6 +1569,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 		memcpy(s->available_coinbase_outputs, datum_last_good_cb_outs,
 		       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
 		s->available_coinbase_outputs_count = datum_last_good_cb_count;
+		s->datum_coinbaser_id = datum_last_good_cb_id;
 		n = datum_last_good_cb_count;
 	}
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
