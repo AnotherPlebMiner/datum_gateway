@@ -1128,12 +1128,12 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(datum_protocol_coinbaser_take_late(got) == 0);
 
 	datum_config.datum_coinbaser_reuse = false;
-	datum_test(!datum_protocol_coinbaser_answer_refreshes());
+	datum_test(!datum_protocol_coinbaser_reuse_active());
 	datum_config.datum_coinbaser_reuse = true;
 	datum_protocol_test_scaled_reuse(false);
-	datum_test(!datum_protocol_coinbaser_answer_refreshes());
+	datum_test(!datum_protocol_coinbaser_reuse_active());
 	datum_protocol_test_scaled_reuse(true);
-	datum_test(datum_protocol_coinbaser_answer_refreshes());
+	datum_test(datum_protocol_coinbaser_reuse_active());
 	datum_protocol_coinbaser_reuse_reset();
 	datum_protocol_test_scaled_reuse(false);
 	datum_config.datum_coinbaser_reuse = saved_reuse;
@@ -2454,6 +2454,8 @@ static bool datum_prev_test_base_is_datum(const unsigned char *tip, bool abw, bo
 	base.height = 42;
 	memcpy(base.prevhash_bin, tip, 32);
 	generate_base_coinbase_txns_for_stratum_job(&base, new_block);
+	// Full-value solo index only for solo while connected, never plain non-pool work.
+	datum_test(base.solo_while_connected == (!base.is_datum_job && datum_protocol_is_active()));
 	return base.is_datum_job;
 }
 
@@ -2547,6 +2549,9 @@ static void datum_coinbaser_prev_block_tests(void) {
 		datum_config.override_mining_pool_scriptpubkey_len = saved_config.override_mining_pool_scriptpubkey_len;
 		memcpy(datum_config.override_mining_pool_scriptpubkey, saved_config.override_mining_pool_scriptpubkey, sizeof(datum_config.override_mining_pool_scriptpubkey));
 		datum_protocol_coinbaser_prev_record(tip_b, 2);
+		// Pool down: plain non-pool work, not solo while connected.
+		atomic_store(&datum_protocol_client_active, 0);
+		datum_test(!datum_prev_test_base_is_datum(tip_d, false, true));
 		datum_protocol_abw_reset();
 		atomic_store(&datum_protocol_client_active, saved_active);
 	}

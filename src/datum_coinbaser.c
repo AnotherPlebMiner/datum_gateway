@@ -416,8 +416,7 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	 * pooled_mining_only off. With no ack the gateway stays on the pool
 	 * coinbase, the same as reuse off. */
 	const bool solo_allowed = datum_protocol_is_active() &&
-		datum_config.datum_coinbaser_reuse &&
-		datum_protocol_scaled_reuse_ok() &&
+		datum_protocol_coinbaser_reuse_active() &&
 		!datum_config.datum_pooled_mining_only &&
 		datum_config.mining_pool_address[0];
 	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
@@ -949,7 +948,7 @@ void *datum_coinbaser_thread(void *ptr) {
 					need_coinbaser = false;
 				}
 				DLOG_DEBUG("Generated and notified.");
-				if (datum_protocol_coinbaser_answer_refreshes() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
+				if (datum_protocol_coinbaser_reuse_active() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
 					// solo until first split: the first split is saved, so move miners onto pooled work
 					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
 					datum_blocktemplates_notify_refresh();
@@ -959,7 +958,7 @@ void *datum_coinbaser_thread(void *ptr) {
 		
 		if (datum_protocol_is_active()) {
 			unsigned char late_tip[32];
-			if (datum_protocol_coinbaser_answer_refreshes() &&
+			if (datum_protocol_coinbaser_reuse_active() &&
 			    datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
 				/* Reuse off does not refresh. A pool slower than 5s would
 				 * otherwise blast new work on every timeout. */

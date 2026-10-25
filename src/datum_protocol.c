@@ -1507,7 +1507,7 @@ bool datum_protocol_scaled_reuse_ok(void) {
 	return atomic_load(&datum_pool_scaled_reuse_ok);
 }
 
-bool datum_protocol_coinbaser_answer_refreshes(void) {
+bool datum_protocol_coinbaser_reuse_active(void) {
 	return datum_config.datum_coinbaser_reuse && datum_protocol_scaled_reuse_ok();
 }
 
@@ -1548,7 +1548,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	/* Exact reuse above does not need consent. A stretch needs the opt-in
 	 * and the pool's ack, and it is not used under ABW: that header is
 	 * masked, so a rejected share loses the block. */
-	if (!datum_config.datum_coinbaser_reuse || !datum_protocol_scaled_reuse_ok() ||
+	if (!datum_protocol_coinbaser_reuse_active() ||
 	    (s->block_template && s->block_template->abw_enabled)) {
 		s->available_coinbase_outputs_count = 0;
 		return 0;
@@ -2009,7 +2009,7 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 
 	/* No ack waits the stock 5s, the same as reuse off. Both the flag and
 	 * the ack are required before a short list is dropped or a split is scaled. */
-	const bool reuse_on = datum_config.datum_coinbaser_reuse && datum_protocol_scaled_reuse_ok();
+	const bool reuse_on = datum_protocol_coinbaser_reuse_active();
 	if (reuse_on) {
 		/* A late answer for exactly this tip and value may already be saved;
 		 * it is the pool's own split, so no new request is needed. */

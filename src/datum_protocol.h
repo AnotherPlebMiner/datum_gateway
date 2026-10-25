@@ -154,8 +154,8 @@ int datum_protocol_coinbaser_fetch(void *s);
 bool datum_protocol_coinbaser_have_saved(void);
 bool datum_protocol_coinbaser_exact_ready(const void *job);
 bool datum_protocol_scaled_reuse_ok(void);
-/* False unless reuse is on and the pool acked, so a late answer does not re-blast work. */
-bool datum_protocol_coinbaser_answer_refreshes(void);
+/* coinbaser_reuse on and the pool acked. Every reuse path checks this; with no ack the gateway behaves as reuse off. */
+bool datum_protocol_coinbaser_reuse_active(void);
 int datum_protocol_coinbaser_prev_solo(const unsigned char *tip);
 void datum_protocol_coinbaser_prev_check(const unsigned char *tip, unsigned int wait_ms);
 int datum_protocol_coinbaser_take_late(unsigned char *prevhash_out);
