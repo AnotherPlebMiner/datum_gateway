@@ -421,10 +421,11 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		datum_config.mining_pool_address[0];
 	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
 	const int prev_solo = (solo_allowed && !no_split) ? datum_protocol_coinbaser_prev_solo(s->prevhash_bin) : 0;
-	/* ABW solos only on a new block. A later value on that tip stays pooled,
-	 * because a stretch would be masked and a repeated solo would loop. */
+	/* Without the pool's ABW ack, a new ABW block solos when solo is allowed.
+	 * A later value on that tip stays pooled. With the ack, ABW stretches. */
 	const bool abw_solo = new_block && solo_allowed &&
 		s->block_template && s->block_template->abw_enabled &&
+		!datum_protocol_abw_scaled_reuse_ok() &&
 		!datum_protocol_coinbaser_exact_ready(s);
 	const bool solo_until_first_split = no_split || prev_solo || abw_solo;
 	if (no_split) {
