@@ -178,6 +178,8 @@ typedef struct T_DATUM_STRATUM_JOB {
 	bool need_coinbaser;
 	
 	bool is_datum_job;
+	/* Full-value solo output while still connected. Plain non-pool work leaves this false. */
+	bool solo_while_connected;
 	
 	bool provisional_split; // coinbases built at creation from the last split (coinbaser_reuse)
 	unsigned char datum_job_idx;

@@ -47,6 +47,7 @@
 #include "datum_conf.h"
 #include "datum_pow.h"
 #include "datum_protocol_internal.h"
+#include "datum_stratum.h"
 #include "datum_queue.h"
 #include "datum_utils.h"
 
@@ -101,6 +102,7 @@ static void datum_protocol_hello_framing_offer_tests(void) {
 	sending_header_key = UINT32_C(0xDC871829);
 	receiving_header_key = 0;
 	datum_framing_v2 = false;
+	datum_config.datum_coinbaser_reuse = false;
 	datum_test(datum_protocol_send_hello(-1) > 0);
 	
 	T_DATUM_PROTOCOL_HEADER header = {0};
@@ -137,6 +139,7 @@ static void datum_protocol_hello_framing_offer_tests(void) {
 			datum_test(!memcmp(p, "DRS\x01", 4));
 			p = &p[4];
 			datum_test((*p & DATUM_DRS_FRAMING_V2_FLAG) != 0);
+			datum_test((*p & DATUM_DRS_SCALED_REUSE_FLAG) == 0);
 		}
 	}
 	datum_test(!datum_framing_v2);
@@ -231,6 +234,32 @@ static void datum_protocol_handshake_bounds_tests(void) {
 	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
 	datum_test(datum_state == 2);
 	datum_test(datum_framing_v2);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_state = 1;
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = false;
+	clear[193] = DATUM_DRS_FRAMING_V2_FLAG | DATUM_DRS_SCALED_REUSE_FLAG;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_state = 1;
+	datum_config.datum_coinbaser_reuse = true;
+	clear[193] = DATUM_DRS_FRAMING_V2_FLAG | DATUM_DRS_SCALED_REUSE_FLAG;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(datum_state == 2);
+	datum_test(datum_framing_v2);
+	datum_test(datum_protocol_scaled_reuse_ok());
+	datum_state = 1;
+	clear[193] = DATUM_DRS_SCALED_REUSE_FLAG;
+	datum_framing_v2 = false;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(datum_protocol_scaled_reuse_ok());
+	datum_test(!datum_framing_v2);
+	datum_state = 1;
+	clear[193] = DATUM_DRS_FRAMING_V2_FLAG;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_test(datum_framing_v2);
+	datum_protocol_test_scaled_reuse(false);
 	datum_state = 1;
 	datum_framing_v2 = false;
 	clear[194] = 0xa5;
@@ -243,6 +272,9 @@ static void datum_protocol_handshake_bounds_tests(void) {
 	datum_test(datum_protocol_test_receive_sealed(clear, 195, &pool_keys) == 1);
 	datum_test(datum_state == 2);
 	datum_test(!datum_framing_v2);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = false;
 	
 	sodium_memzero(&remote, sizeof(remote));
 	local_datum_keys = saved_local;
@@ -1007,6 +1039,9 @@ static void datum_coinbaser_reuse_test_save(T_DATUM_STRATUM_JOB *job, const unsi
 }
 
 static void datum_coinbaser_reuse_pool_and_late_tests(void) {
+	const bool saved_reuse = datum_config.datum_coinbaser_reuse;
+	datum_config.datum_coinbaser_reuse = true;
+	datum_protocol_test_scaled_reuse(true);
 	T_DATUM_STRATUM_JOB job;
 	unsigned char tip_a[32], tip_b[32], got[32];
 	unsigned char resp[12 + 1 + 2 * (8 + 1 + 22)];
@@ -1039,13 +1074,12 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(job.datum_coinbaser_id == 0);
 	datum_test(job.available_coinbase_outputs[0].value_sats + job.available_coinbase_outputs[1].value_sats == 800000000);
 
-	// A new session keeps the stretched reuse but not the id.
+	// A new session does not reuse the saved split.
 	atomic_store(&datum_session_generation, gen + 1);
 	memset(&job, 0, sizeof(job));
 	memcpy(job.prevhash_bin, tip_a, 32);
 	job.coinbase_value = 400000000;
-	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
-	datum_test(job.datum_coinbaser_id == 0);
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
 	atomic_store(&datum_session_generation, gen);
 
 	// Another pool's split is never reused.
@@ -1093,11 +1127,23 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(datum_protocol_coinbaser_fetch_response((int)sizeof(resp), resp) == 1);
 	datum_test(datum_protocol_coinbaser_take_late(got) == 0);
 
+	datum_config.datum_coinbaser_reuse = false;
+	datum_test(!datum_protocol_coinbaser_answer_refreshes());
+	datum_config.datum_coinbaser_reuse = true;
+	datum_protocol_test_scaled_reuse(false);
+	datum_test(!datum_protocol_coinbaser_answer_refreshes());
+	datum_protocol_test_scaled_reuse(true);
+	datum_test(datum_protocol_coinbaser_answer_refreshes());
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = saved_reuse;
 	datum_config.prime_id = saved_prime;
 }
 
 static void datum_coinbaser_reuse_same_tip_tests(void) {
+	const bool saved_reuse = datum_config.datum_coinbaser_reuse;
+	datum_config.datum_coinbaser_reuse = true;
+	datum_protocol_test_scaled_reuse(true);
 	T_DATUM_STRATUM_JOB job;
 	unsigned char tip_a[32];
 	unsigned char tip_b[32];
@@ -1167,7 +1213,101 @@ static void datum_coinbaser_reuse_same_tip_tests(void) {
 	datum_protocol_coinbaser_reuse_reset();
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
 
+	/* No ack, and an ABW template, both refuse a stretch. */
+	for (i = 0; i < 3; i++) {
+		job.available_coinbase_outputs[i].value_sats = (uint64_t)(1000 + i);
+		job.available_coinbase_outputs[i].output_script_len = 22;
+		memset(job.available_coinbase_outputs[i].output_script, (unsigned char)(0x10 + i), 22);
+	}
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 3003;
+	datum_protocol_coinbaser_save_good(&job, 3);
+	datum_protocol_coinbaser_prev_record(tip_b, 1);
+	memcpy(job.prevhash_bin, tip_b, 32);
+	memset(job.available_coinbase_outputs, 0, sizeof(job.available_coinbase_outputs));
+	job.available_coinbase_outputs_count = 0;
+	job.coinbase_value = 6006;
+	job.block_template = NULL;
+	datum_protocol_test_scaled_reuse(false);
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	datum_protocol_test_scaled_reuse(true);
+	{
+		static T_DATUM_TEMPLATE_DATA abw;
+		memset(&abw, 0, sizeof(abw));
+		abw.abw_enabled = true;
+		job.block_template = &abw;
+		datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+		job.block_template = NULL;
+	}
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+
+	/* 1000 scales under 546. A 0-value output does not block the stretch. */
+	job.available_coinbase_outputs[0].value_sats = 1000;
+	job.available_coinbase_outputs[1].value_sats = 10000;
+	job.available_coinbase_outputs[0].output_script_len = 22;
+	job.available_coinbase_outputs[1].output_script_len = 22;
+	memset(job.available_coinbase_outputs[0].output_script, 0x21, 22);
+	memset(job.available_coinbase_outputs[1].output_script, 0x22, 22);
+	job.available_coinbase_outputs_count = 2;
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 11000;
+	datum_protocol_coinbaser_save_good(&job, 2);
+	datum_protocol_coinbaser_prev_record(tip_b, 1);
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 5000;
+	job.available_coinbase_outputs_count = 0;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
+	job.available_coinbase_outputs[0].value_sats = 0;
+	job.available_coinbase_outputs[1].value_sats = 2000;
+	job.available_coinbase_outputs[2].value_sats = 2000;
+	job.available_coinbase_outputs[2].output_script_len = 22;
+	memset(job.available_coinbase_outputs[2].output_script, 0x23, 22);
+	job.available_coinbase_outputs_count = 3;
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 4000;
+	datum_protocol_coinbaser_save_good(&job, 3);
+	datum_protocol_coinbaser_prev_record(tip_b, 1);
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 8000;
+	job.available_coinbase_outputs_count = 0;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
+
+	/* Remainder to the pool-script output, otherwise the last output. */
+	job.available_coinbase_outputs[0].value_sats = 1000;
+	job.available_coinbase_outputs[1].value_sats = 1001;
+	job.available_coinbase_outputs[0].output_script_len = 22;
+	job.available_coinbase_outputs[1].output_script_len = 22;
+	memset(job.available_coinbase_outputs[0].output_script, 0x31, 22);
+	memset(job.available_coinbase_outputs[1].output_script, 0x32, 22);
+	job.available_coinbase_outputs_count = 2;
+	memcpy(job.prevhash_bin, tip_a, 32);
+	job.coinbase_value = 2001;
+	datum_protocol_coinbaser_save_good(&job, 2);
+	datum_protocol_coinbaser_prev_record(tip_b, 1);
+	const int saved_pool_len = datum_config.override_mining_pool_scriptpubkey_len;
+	unsigned char saved_pool_script[sizeof(datum_config.override_mining_pool_scriptpubkey)];
+	memcpy(saved_pool_script, datum_config.override_mining_pool_scriptpubkey, sizeof(saved_pool_script));
+	datum_config.override_mining_pool_scriptpubkey_len = 22;
+	memset(datum_config.override_mining_pool_scriptpubkey, 0x31, 22);
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 4000;
+	job.available_coinbase_outputs_count = 0;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.available_coinbase_outputs[0].value_sats == 2000);
+	datum_test(job.available_coinbase_outputs[1].value_sats == 2000);
+	datum_config.override_mining_pool_scriptpubkey_len = 0;
+	memcpy(job.prevhash_bin, tip_b, 32);
+	job.coinbase_value = 4000;
+	job.available_coinbase_outputs_count = 0;
+	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 2);
+	datum_test(job.available_coinbase_outputs[0].value_sats == 1999);
+	datum_test(job.available_coinbase_outputs[1].value_sats == 2001);
+	datum_config.override_mining_pool_scriptpubkey_len = saved_pool_len;
+	memcpy(datum_config.override_mining_pool_scriptpubkey, saved_pool_script, sizeof(saved_pool_script));
+
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = saved_reuse;
 }
 
 static void datum_protocol_migration_tests(void) {
@@ -2012,6 +2152,9 @@ static int datum_prev_test_fetch(T_DATUM_STRATUM_JOB *job, bool answer, uint64_t
 #define DATUM_PREV_TEST_UNREAD (-1)
 
 static void datum_coinbaser_prev_block_fetch_tests(void) {
+	const bool saved_reuse = datum_config.datum_coinbaser_reuse;
+	datum_config.datum_coinbaser_reuse = true;
+	datum_protocol_test_scaled_reuse(true);
 	const global_config_t saved_config = datum_config;
 	const int saved_active = atomic_load(&datum_protocol_client_active);
 	const int saved_out = server_out_buf;
@@ -2225,8 +2368,69 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 	datum_test(server.saw_getblock);
 	datum_test(datum_protocol_coinbaser_prev_solo(tip_g) == 0);
 
+	/* Reuse on and no ack: a pool job, no previous-block read, stock fetch. */
+	{
+		static T_DATUM_TEMPLATE_DATA tdata;
+		T_DATUM_STRATUM_JOB *built;
+		const bool saved_pooled = datum_config.datum_pooled_mining_only;
+		const int saved_pool_len = datum_config.override_mining_pool_scriptpubkey_len;
+		unsigned char saved_pool_script[sizeof(datum_config.override_mining_pool_scriptpubkey)];
+		memcpy(saved_pool_script, datum_config.override_mining_pool_scriptpubkey, sizeof(saved_pool_script));
+		datum_protocol_test_scaled_reuse(false);
+		datum_config.datum_coinbaser_reuse = true;
+		datum_config.datum_pooled_mining_only = false;
+		strcpy(datum_config.mining_pool_address, "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
+		datum_config.override_mining_pool_scriptpubkey_len = 22;
+		memset(datum_config.override_mining_pool_scriptpubkey, 0x51, 22);
+		datum_protocol_coinbaser_reuse_reset();
+		{
+			unsigned char notice[36] = { DATUM_ABW_DRAFT_REVISION, DATUM_ABW_ASSIGNMENT_ACTIVE, 0 };
+			memset(notice + 3, 0x5a, 32);
+			notice[35] = 0xFE;
+			datum_test(datum_protocol_abw_assignment_notice(sizeof(notice), notice));
+		}
+		datum_test(datum_protocol_is_active());
+		memset(&job, 0, sizeof(job));
+		job.block_template = &tdata;
+		memset(&tdata, 0, sizeof(tdata));
+		strcpy(tdata.default_witness_commitment, "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000");
+		tdata.height = 42;
+		tdata.coinbasevalue = 310000000;
+		memcpy(tdata.previousblockhash_bin, tip_e, 32);
+		job.coinbase_value = 310000000;
+		job.height = 42;
+		memcpy(job.prevhash_bin, tip_e, 32);
+		generate_base_coinbase_txns_for_stratum_job(&job, true);
+		datum_test(job.is_datum_job);
+		tdata.abw_enabled = true;
+		generate_base_coinbase_txns_for_stratum_job(&job, true);
+		datum_test(job.is_datum_job);
+		datum_prev_test_save(&job, tip_a, split, 3);
+		datum_protocol_coinbaser_prev_record(tip_e, 1);
+		datum_prev_test_serve(&server, tip_e, other_hex, 0);
+		update_stratum_job(&tdata, true, JOB_STATE_EMPTY_PLUS);
+		datum_prev_test_unserve(&server);
+		datum_test(!server.saw_getblock);
+		built = global_cur_stratum_jobs[global_latest_stratum_job_index];
+		datum_test(built && built->is_datum_job && !built->provisional_split);
+		datum_prev_test_answer(310000000, fresh, 2);
+		memset(&job, 0, sizeof(job));
+		memcpy(job.prevhash_bin, tip_e, 32);
+		job.coinbase_value = 310000000;
+		job.is_datum_job = false;
+		r = datum_prev_test_fetch(&job, true, &ms);
+		datum_test(r == 2);
+		datum_test(ms >= 40 && ms < 500);
+		datum_config.datum_pooled_mining_only = saved_pooled;
+		datum_config.override_mining_pool_scriptpubkey_len = saved_pool_len;
+		memcpy(datum_config.override_mining_pool_scriptpubkey, saved_pool_script, sizeof(saved_pool_script));
+		datum_protocol_test_scaled_reuse(true);
+	}
+
 	datum_prev_check_wait(NULL);
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = saved_reuse;
 	atomic_store(&datum_protocol_client_active, saved_active);
 	server_out_buf = saved_out;
 	sending_header_key = saved_header_key;
@@ -2235,11 +2439,12 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 }
 
 /* Builds the base coinbase for a job on tip; returns whether it pays the pool. */
-static bool datum_prev_test_base_is_datum(const unsigned char *tip) {
+static bool datum_prev_test_base_is_datum(const unsigned char *tip, bool abw, bool new_block) {
 	static T_DATUM_TEMPLATE_DATA tdata;
 	static T_DATUM_STRATUM_JOB base;
 	memset(&tdata, 0, sizeof(tdata));
 	memset(&base, 0, sizeof(base));
+	tdata.abw_enabled = abw;
 	tdata.sizelimit = 4000000;
 	tdata.weightlimit = 4000000;
 	tdata.sigoplimit = 80000;
@@ -2248,11 +2453,14 @@ static bool datum_prev_test_base_is_datum(const unsigned char *tip) {
 	base.coinbase_value = 310000000;
 	base.height = 42;
 	memcpy(base.prevhash_bin, tip, 32);
-	generate_base_coinbase_txns_for_stratum_job(&base, false);
+	generate_base_coinbase_txns_for_stratum_job(&base, new_block);
 	return base.is_datum_job;
 }
 
 static void datum_coinbaser_prev_block_tests(void) {
+	const bool saved_reuse = datum_config.datum_coinbaser_reuse;
+	datum_config.datum_coinbaser_reuse = true;
+	datum_protocol_test_scaled_reuse(true);
 	const global_config_t saved_config = datum_config;
 	const unsigned char split[3] = { 0x30, 0x31, 0x32 };
 	const unsigned char paid_two[2] = { 0x31, 0x30 };
@@ -2319,17 +2527,25 @@ static void datum_coinbaser_prev_block_tests(void) {
 		strcpy(datum_config.mining_pool_address, "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
 		datum_config.override_mining_pool_scriptpubkey[0] = 0x51;
 		datum_config.override_mining_pool_scriptpubkey_len = 1;
-		datum_test(!datum_prev_test_base_is_datum(tip_b));
+		datum_test(!datum_prev_test_base_is_datum(tip_b, false, false));
 		// unverified, then not the pool's, then unreadable
-		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_test(!datum_prev_test_base_is_datum(tip_d, false, false));
 		datum_protocol_coinbaser_prev_record(tip_d, 1);
-		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_test(datum_prev_test_base_is_datum(tip_d, false, false));
+		datum_test(!datum_prev_test_base_is_datum(tip_d, true, true));
+		datum_test(datum_prev_test_base_is_datum(tip_d, true, false));
+		datum_protocol_test_scaled_reuse(false);
+		datum_test(datum_prev_test_base_is_datum(tip_d, false, true));
+		datum_test(datum_prev_test_base_is_datum(tip_d, false, false));
+		datum_protocol_test_scaled_reuse(true);
 		datum_protocol_coinbaser_prev_record(tip_d, -1);
-		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_test(!datum_prev_test_base_is_datum(tip_d, false, false));
 		datum_config.datum_pooled_mining_only = true;
-		datum_test(datum_prev_test_base_is_datum(tip_b));
-		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_test(datum_prev_test_base_is_datum(tip_b, false, false));
+		datum_test(datum_prev_test_base_is_datum(tip_d, false, false));
 		datum_config.datum_pooled_mining_only = false;
+		datum_config.override_mining_pool_scriptpubkey_len = saved_config.override_mining_pool_scriptpubkey_len;
+		memcpy(datum_config.override_mining_pool_scriptpubkey, saved_config.override_mining_pool_scriptpubkey, sizeof(datum_config.override_mining_pool_scriptpubkey));
 		datum_protocol_coinbaser_prev_record(tip_b, 2);
 		datum_protocol_abw_reset();
 		atomic_store(&datum_protocol_client_active, saved_active);
@@ -2425,7 +2641,8 @@ static void datum_coinbaser_prev_block_tests(void) {
 		len = datum_prev_test_block(hex, sizeof(hex), tip_a, paid_one, 2, true, true);
 		datum_test(datum_protocol_coinbaser_prev_block_matches(hex, len, job.available_coinbase_outputs, 3, parent, datum_config.override_mining_pool_scriptpubkey, 70, &paid_pool) == 0);
 		datum_test(paid_pool);
-		datum_config.override_mining_pool_scriptpubkey_len = 0;
+		datum_config.override_mining_pool_scriptpubkey_len = saved_config.override_mining_pool_scriptpubkey_len;
+		memcpy(datum_config.override_mining_pool_scriptpubkey, saved_config.override_mining_pool_scriptpubkey, sizeof(datum_config.override_mining_pool_scriptpubkey));
 	}
 
 	// An unreadable block stays unverified: no stretch, and solo work.
@@ -2446,6 +2663,8 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
 
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
+	datum_config.datum_coinbaser_reuse = saved_reuse;
 	datum_config = saved_config;
 }
 

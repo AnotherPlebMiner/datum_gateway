@@ -412,36 +412,41 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	int cb2idx[1] = { 0 };
 	int target_pot_index;
 	
-	/* Solo until first split: with coinbaser_reuse on and pooled_mining_only
-	 * off (the operator already accepts solo when the pool is down), a pooled
-	 * job is only built once a split from this pool is held. Before that, on
-	 * first connection or after switching pool, the job pays
-	 * mining.pool_address instead of the pool's script alone. The coinbaser
-	 * thread still asks the pool, and replaces this work once it answers.
-	 * The same holds on a new tip until the previous block is verified as
-	 * not the pool's: the saved split may be stale and is not reused. */
+	/* Solo while connected needs reuse on, the pool's hello ack, and
+	 * pooled_mining_only off. With no ack the gateway stays on the pool
+	 * coinbase, the same as reuse off. */
 	const bool solo_allowed = datum_protocol_is_active() &&
 		datum_config.datum_coinbaser_reuse &&
+		datum_protocol_scaled_reuse_ok() &&
 		!datum_config.datum_pooled_mining_only &&
 		datum_config.mining_pool_address[0];
 	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
 	const int prev_solo = (solo_allowed && !no_split) ? datum_protocol_coinbaser_prev_solo(s->prevhash_bin) : 0;
-	const bool solo_until_first_split = no_split || prev_solo;
+	/* ABW solos only on a new block. A later value on that tip stays pooled,
+	 * because a stretch would be masked and a repeated solo would loop. */
+	const bool abw_solo = new_block && solo_allowed &&
+		s->block_template && s->block_template->abw_enabled &&
+		!datum_protocol_coinbaser_exact_ready(s);
+	const bool solo_until_first_split = no_split || prev_solo || abw_solo;
 	if (no_split) {
 		DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
 	} else if (prev_solo == 1) {
 		DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
 	} else if (prev_solo) {
 		DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
+	} else if (abw_solo) {
+		DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
 	}
+	s->solo_while_connected = false;
 	if (datum_protocol_is_active() && !solo_until_first_split) {
 		// DATUM
 		s->pool_addr_script_len = datum_config.override_mining_pool_scriptpubkey_len;
 		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptpubkey, datum_config.override_mining_pool_scriptpubkey_len);
 		s->is_datum_job = true;
 	} else {
-		// No pool
+		// No pool, or solo while connected and the pool has acked.
 		s->pool_addr_script_len = addr_2_output_script(datum_config.mining_pool_address, &s->pool_addr_script[0], 64);
+		s->solo_while_connected = solo_until_first_split;
 		s->is_datum_job = false;
 	}
 	if (!s->pool_addr_script_len) {
@@ -944,7 +949,7 @@ void *datum_coinbaser_thread(void *ptr) {
 					need_coinbaser = false;
 				}
 				DLOG_DEBUG("Generated and notified.");
-				if (datum_config.datum_coinbaser_reuse && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
+				if (datum_protocol_coinbaser_answer_refreshes() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
 					// solo until first split: the first split is saved, so move miners onto pooled work
 					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
 					datum_blocktemplates_notify_refresh();
@@ -952,9 +957,12 @@ void *datum_coinbaser_thread(void *ptr) {
 			}
 		}
 		
-		if (datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+		if (datum_protocol_is_active()) {
 			unsigned char late_tip[32];
-			if (datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
+			if (datum_protocol_coinbaser_answer_refreshes() &&
+			    datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
+				/* Reuse off does not refresh. A pool slower than 5s would
+				 * otherwise blast new work on every timeout. */
 				datum_blocktemplates_notify_refresh();
 			}
 		}
