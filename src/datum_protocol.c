@@ -1425,6 +1425,7 @@ static uint64_t datum_last_req_session = 0;
 static bool datum_last_req_unanswered = false;
 
 #define DATUM_COINBASER_FAST_WAIT_MS 500
+static uint64_t datum_test_last_request_ms = 0; // coinbaser_test_interval_seconds: when a request last went to the pool
 
 /* Previous-block check: on a new tip, the block just found is read from
  * bitcoind. If its coinbase pays 2 or more of the saved split's scripts, the
@@ -2064,6 +2065,15 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			return exact;
 		}
 	}
+	if (reuse_on && datum_config.datum_coinbaser_test_interval_seconds > 0 && datum_test_last_request_ms &&
+	    current_time_millis() - datum_test_last_request_ms < (uint64_t)datum_config.datum_coinbaser_test_interval_seconds * 1000) {
+		const int held = datum_protocol_coinbaser_try_reuse(s);
+		if (held >= 2) {
+			DLOG_WARN("Coinbaser TEST throttle: no request (last one %" PRIu64 " s ago, interval %d s); job value %" PRIu64 " uses the stretched split (%d outs)",
+			          (current_time_millis() - datum_test_last_request_ms) / 1000, datum_config.datum_coinbaser_test_interval_seconds, value, held);
+			return held;
+		}
+	}
 	struct timespec ts_fast;
 	struct timespec ts_full;
 	bool in_fast_wait = reuse_on;
@@ -2085,6 +2095,7 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
+	datum_test_last_request_ms = current_time_millis();
 	if (reuse_on) {
 		/* Read the previous block while the pool answers. The loop below looks
 		 * for an answer before waiting, so none is lost while unlocked. */

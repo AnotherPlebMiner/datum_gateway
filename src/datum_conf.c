@@ -204,6 +204,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse_abw",		.description = "Offer the ABW stretch bit in the hello, and only when coinbaser_reuse is also on. Default off. Startup fails if this is on and coinbaser_reuse is off. The gateway stretches on ABW only when the pool acks this bit and scaled reuse. A 0x08 ack without a 0x04 ack is ignored.",
 		.example_default = false,
 		.required = false, .ptr = &datum_config.datum_coinbaser_reuse_abw, 	.default_bool = false },
+	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "coinbaser_test_interval_seconds",	.description = "TEST ONLY. With coinbaser_reuse on, ask the pool for a coinbase split at most once per this many seconds; every job in between is built from the last split stretched to its value. 0 = off (always ask)",
+		.required = false, .ptr = &datum_config.datum_coinbaser_test_interval_seconds, 	.default_int = 0 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "protocol_global_timeout",		.description = "If no valid messages are received from the DATUM server in this many seconds, give up and try to reconnect",
 		.required = false, .ptr = &datum_config.datum_protocol_global_timeout, 	.default_int = 60 },
 };
