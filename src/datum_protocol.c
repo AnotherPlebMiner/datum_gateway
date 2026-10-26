@@ -1372,6 +1372,33 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	return 1;
 }
 
+/* Log a split's outputs as amount@last 4 script bytes, 20 per line, so a block's coinbase can be checked against the pool's
+ * answer and the stretch of it (the log line limit is 1023 bytes). */
+static void datum_protocol_log_split(const char *what, const T_DATUM_TXN_OUTPUT *o, int n, uint64_t ref, unsigned id, const unsigned char *tip) {
+	uint64_t sum = 0;
+	int i, j;
+	char tip_hex[65] = "?";
+	if (tip) {
+		for (i = 0; i < 32; i++) uchar_to_hex(&tip_hex[i * 2], tip[31 - i]);
+		tip_hex[64] = 0;
+	}
+	for (i = 0; i < n; i++) sum += o[i].value_sats;
+	DLOG_INFO("Coinbaser SPLIT %s: %d outs, sum %" PRIu64 ", ref %" PRIu64 ", id %u, prime %16.16" PRIx64 ", pool %.12s, tip %s",
+	         what, n, sum, ref, id, datum_config.prime_id, datum_config.datum_pool_pubkey, tip_hex);
+	for (i = 0; i < n; i += 20) {
+		char line[900];
+		size_t len = 0;
+		line[0] = 0;
+		for (j = i; j < n && j < i + 20 && len < sizeof(line) - 40; j++) {
+			unsigned char t[4] = {0, 0, 0, 0};
+			const int sl = o[j].output_script_len;
+			if (sl >= 4 && sl <= (int)sizeof(o[j].output_script)) memcpy(t, o[j].output_script + sl - 4, 4);
+			len += (size_t)snprintf(line + len, sizeof(line) - len, "%s%" PRIu64 "@%02x%02x%02x%02x", j > i ? "," : "", o[j].value_sats, t[0], t[1], t[2], t[3]);
+		}
+		DLOG_INFO("Coinbaser SPLIT %s outs %d-%d: %s", what, i, j - 1, line);
+	}
+}
+
 /* Last successful multi-out coinbaser.
  * Same tip and same value: exact reuse.
  * Same tip with a new value, or a new tip: stretch the last list onto the
@@ -1547,12 +1574,14 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	uint64_t new_value = 0;
 	uint64_t total = 0;
 	uint64_t assigned = 0;
+	unsigned char base_tip[32] = {0};
 	if (!s) return 0;
 	new_value = s->coinbase_value;
 	if (new_value == 0) return 0;
 	n = datum_protocol_coinbaser_try_exact(s);
 	if (n >= 2) {
 		DLOG_INFO("Coinbaser: using the pool's split for this tip and value (%d outs, id %u)", n, (unsigned)s->datum_coinbaser_id);
+		datum_protocol_log_split("exact-reuse", s->available_coinbase_outputs, n, new_value, s->datum_coinbaser_id, s->prevhash_bin);
 		return n;
 	}
 	/* Exact reuse above does not need consent. A stretch needs the opt-in
@@ -1576,6 +1605,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 		return 0;
 	}
 	if (datum_last_good_matches_pool_locked()) {
+		memcpy(base_tip, datum_last_good_prevhash, 32);
 		memcpy(s->available_coinbase_outputs, datum_last_good_cb_outs,
 		       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)datum_last_good_cb_count);
 		s->available_coinbase_outputs_count = datum_last_good_cb_count;
@@ -1598,6 +1628,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	if (total != new_value) {
 		int pool_out = -1;
 		const int pool_len = datum_config.override_mining_pool_scriptpubkey_len;
+		datum_protocol_log_split("stretch-base", s->available_coinbase_outputs, n, total, s->datum_coinbaser_id, base_tip);
 		for (i = 0; i < n; i++) {
 			uint64_t original = s->available_coinbase_outputs[i].value_sats;
 			uint64_t scaled = (uint64_t)(((unsigned __int128)original * new_value) / total);
@@ -1619,7 +1650,9 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 			/* Pool-script output when the split has one, otherwise the last output. */
 			int dest = pool_out >= 0 ? pool_out : n - 1;
 			s->available_coinbase_outputs[dest].value_sats += (new_value - assigned);
+			DLOG_INFO("Coinbaser: stretch rounding remainder %" PRIu64 " sat added to output %d", new_value - assigned, dest);
 		}
+		datum_protocol_log_split("stretch-out", s->available_coinbase_outputs, n, new_value, s->datum_coinbaser_id, s->prevhash_bin);
 	}
 	DLOG_INFO("Coinbaser: provisional split, last split stretched (%d outs) %" PRIu64 " -> %" PRIu64, n, total, new_value);
 	return n;
@@ -1627,6 +1660,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 
 void datum_protocol_coinbaser_save_good(T_DATUM_STRATUM_JOB *s, int n) {
 	if (!s || n < 2) return;
+	datum_protocol_log_split("pool-answer", s->available_coinbase_outputs, n, s->coinbase_value, s->datum_coinbaser_id, s->prevhash_bin);
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
 	memcpy(datum_last_good_cb_outs, s->available_coinbase_outputs,
 	       sizeof(T_DATUM_TXN_OUTPUT) * (size_t)n);
